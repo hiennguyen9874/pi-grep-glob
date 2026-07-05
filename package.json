@@ -1,8 +1,8 @@
 {
-  "name": "pi-edit",
+  "name": "pi-shake",
   "version": "0.1.0",
-  "description": "Simple edit tool.",
-  "author": "pi-edit contributors",
+  "description": "",
+  "author": "pi-shake contributors",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
