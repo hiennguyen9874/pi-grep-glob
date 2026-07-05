@@ -180,3 +180,5 @@ test.json
 native.json
 examples
 native/target
+native/index.d.ts
+native/index.node

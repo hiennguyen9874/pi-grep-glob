@@ -353,19 +353,36 @@ Phase 1 file changes:
 
 Validation: `cargo test --manifest-path native/Cargo.toml` passed with 50 unit tests; the copied glob doc test is ignored.
 
-### Phase 2 — Native loader
+### Phase 2 — Native loader — Done
 
-1. Create `src/types.ts`.
-2. Create `src/native.ts`.
-3. Build native addon:
+- [x] Create `src/types.ts`.
+- [x] Create `src/native.ts`.
+- [x] Build native addon:
 
 ```bash
 npm run build:native
 ```
 
-4. Add a Vitest that imports `src/native.ts` and calls native `glob()` on a temp fixture.
+- [x] Add a Vitest that imports `src/native.ts` and calls native `glob()` on a temp fixture.
 
 Success: a TypeScript test can load the `.node` and call `glob()`.
+
+Phase 2 file changes:
+
+- Added `src/types.ts` with TypeScript DTOs for the native grep/glob exports.
+- Added `src/native.ts` with a resilient `.node` loader, runtime enum objects, and normalized native exports.
+- Added `test/native.test.ts` to load the native addon and call `glob()` against a temp fixture.
+- Added `build:native` and `@napi-rs/cli` so `npm run build:native` can build the addon.
+- Ignored generated local N-API output:
+  - `native/index.d.ts`
+  - `native/index.node`
+
+Validation:
+
+- `npm run build:native` passed and produced `native/index.node`.
+- `npx vitest run test/native.test.ts` passed.
+- `npx tsc --noEmit` passed.
+- `npm test` passed.
 
 ### Phase 3 — Tool wrappers
 
