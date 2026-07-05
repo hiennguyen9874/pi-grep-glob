@@ -384,25 +384,29 @@ Validation:
 - `npx tsc --noEmit` passed.
 - `npm test` passed.
 
-### Phase 3 — Tool wrappers
+### Phase 3 — Tool wrappers — Done
 
-1. Create `src/tools/glob.ts`.
-2. Create `src/tools/grep.ts`.
-3. Create minimal `src/utils/path-utils.ts` and `src/utils/format.ts`.
-4. Update `src/index.ts`:
+- [x] Create `src/tools/glob.ts`.
+- [x] Create `src/tools/grep.ts`.
+- [x] Create minimal `src/utils/path-utils.ts` and `src/utils/format.ts`.
+- [x] Update `src/index.ts` to register both tools.
 
-```ts
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createGrepTool } from "./tools/grep.js";
-import { createGlobTool } from "./tools/glob.js";
+Phase 3 file changes:
 
-export default function (pi: ExtensionAPI) {
-  pi.registerTool(createGrepTool());
-  pi.registerTool(createGlobTool());
-}
-```
+- Added `src/tools/glob.ts` with a Pi `glob` tool wrapper around native `glob()`.
+- Added `src/tools/grep.ts` with a Pi `grep` tool wrapper around native `grep()` and file-level pagination.
+- Added shared helpers:
+  - `src/utils/path-utils.ts`
+  - `src/utils/format.ts`
+- Updated `src/index.ts` to register `grep` and `glob`.
+- Changed the package peer dependency from `@sinclair/typebox` to `typebox`, matching the Pi extension API.
 
-Success: `pi -e ./src/index.ts` exposes `grep` and `glob`.
+Validation:
+
+- `npx tsc --noEmit` passed.
+- `npm test` passed.
+
+Success target: `pi -e ./src/index.ts` should expose `grep` and `glob`; interactive Pi smoke test not run in this phase.
 
 ### Phase 4 — Tests
 
