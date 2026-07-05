@@ -77,7 +77,7 @@ export function parsePathSpec(rawPath: string, cwd: string): PathSpec {
       return {
         absoluteRoot: absolutePath,
         displayPrefix: toDisplayPath(absolutePath, cwd),
-        pattern: "*",
+        pattern: "**/*",
       };
     }
 
@@ -116,13 +116,16 @@ function splitGlobRoot(value: string): { root: string; pattern: string } {
   const magicIndex = parts.findIndex(hasGlobMagic);
 
   if (magicIndex === -1) {
-    return { root: value, pattern: "*" };
+    return { root: value, pattern: "**/*" };
   }
 
   const rootParts = parts.slice(0, magicIndex).filter(Boolean);
   const patternParts = parts.slice(magicIndex).filter(Boolean);
   const root = absoluteRoot ? path.join(absoluteRoot, ...rootParts) : rootParts.join("/") || ".";
-  const pattern = patternParts.join("/") || "*";
+  let pattern = patternParts.join("/") || "**/*";
+  if (magicIndex === 0 && !pattern.startsWith("**/")) {
+    pattern = `**/${pattern}`;
+  }
 
   return { root, pattern };
 }

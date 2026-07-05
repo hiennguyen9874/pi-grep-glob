@@ -31,14 +31,10 @@
     ]
   },
   "dependencies": {
-    "@napi-rs/cli": "^3.0.0",
-    "diff": "^8.0.2",
-    "file-type": "^21.3.4"
+    "@napi-rs/cli": "^3.0.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.74.0",
     "@earendil-works/pi-coding-agent": ">=0.74.0",
-    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "scripts": {

@@ -149,11 +149,8 @@ function clampNonNegativeInteger(value: number | undefined): number {
 }
 
 function validateRegexPattern(pattern: string): void {
-  try {
-    new RegExp(pattern);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid regex: ${message}`);
+  if (!pattern.trim()) {
+    throw new Error("Pattern must not be empty");
   }
 }
 

@@ -47,6 +47,39 @@ describe("glob tool", () => {
     });
   });
 
+  it("recursively finds nested files for a directory path", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "src", "nested"), { recursive: true });
+      await writeFile(join(fixture, "src", "index.ts"), "export const index = 1;\n");
+      await writeFile(join(fixture, "src", "nested", "thing.ts"), "export const thing = 1;\n");
+
+      const result = await executeTool(createGlobTool(), { path: "src", gitignore: false }, fixture);
+      expect(textOf(result).split("\n").sort()).toEqual(["src/index.ts", "src/nested/", "src/nested/thing.ts"]);
+    });
+  });
+
+  it("recursively finds nested files for a leading glob", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "nested"), { recursive: true });
+      await writeFile(join(fixture, "top.ts"), "export const top = 1;\n");
+      await writeFile(join(fixture, "nested", "thing.ts"), "export const thing = 1;\n");
+
+      const result = await executeTool(createGlobTool(), { path: "*.ts", gitignore: false }, fixture);
+      expect(textOf(result).split("\n").sort()).toEqual(["nested/thing.ts", "top.ts"]);
+    });
+  });
+
+  it("keeps scoped single-star globs non-recursive", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "src", "nested"), { recursive: true });
+      await writeFile(join(fixture, "src", "index.ts"), "export const index = 1;\n");
+      await writeFile(join(fixture, "src", "nested", "thing.ts"), "export const thing = 1;\n");
+
+      const result = await executeTool(createGlobTool(), { path: "src/*.ts", gitignore: false }, fixture);
+      expect(textOf(result).split("\n")).toEqual(["src/index.ts"]);
+    });
+  });
+
   it("respects gitignore", async () => {
     await withFixture(async (fixture) => {
       await writeFile(join(fixture, ".gitignore"), "ignored.ts\n");
@@ -149,11 +182,31 @@ describe("grep tool", () => {
     });
   });
 
-  it("handles invalid regex", async () => {
+  it("accepts Rust regex syntax that JavaScript RegExp rejects", async () => {
+    await withFixture(async (fixture) => {
+      await writeFile(join(fixture, "a.txt"), "Hello\n");
+
+      const result = await executeTool(createGrepTool(), { pattern: "(?i)hello", path: "a.txt" }, fixture);
+      expect(textOf(result)).toContain("*1|Hello");
+    });
+  });
+
+  it("rejects empty regex patterns", async () => {
     await withFixture(async (fixture) => {
       await writeFile(join(fixture, "a.txt"), "text\n");
 
-      await expect(executeTool(createGrepTool(), { pattern: "(", path: "a.txt" }, fixture)).rejects.toThrow(/Invalid regex:/);
+      await expect(executeTool(createGrepTool(), { pattern: "  ", path: "a.txt" }, fixture)).rejects.toThrow(
+        /Pattern must not be empty/,
+      );
+    });
+  });
+
+  it("preserves native literal fallback for unclosed groups", async () => {
+    await withFixture(async (fixture) => {
+      await writeFile(join(fixture, "a.txt"), "call(\n");
+
+      const result = await executeTool(createGrepTool(), { pattern: "(", path: "a.txt" }, fixture);
+      expect(textOf(result)).toContain("*1|call(");
     });
   });
 
