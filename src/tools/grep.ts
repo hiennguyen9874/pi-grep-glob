@@ -79,6 +79,8 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
 }
 
 async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | undefined) {
+  validateRegexPattern(params.pattern);
+
   const grouped = new Map<string, GrepMatch[]>();
   let filesSearched = 0;
   let totalMatches = 0;
@@ -146,8 +148,20 @@ function clampNonNegativeInteger(value: number | undefined): number {
   return Math.max(0, Math.trunc(value));
 }
 
+function validateRegexPattern(pattern: string): void {
+  try {
+    new RegExp(pattern);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid regex: ${message}`);
+  }
+}
+
 function normalizeGrepError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("Invalid regex:")) {
+    return error instanceof Error ? error : new Error(message);
+  }
   if (/regex/i.test(message)) {
     return new Error(`Invalid regex: ${message}`);
   }

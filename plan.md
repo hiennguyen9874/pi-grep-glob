@@ -408,34 +408,56 @@ Validation:
 
 Success target: `pi -e ./src/index.ts` should expose `grep` and `glob`; interactive Pi smoke test not run in this phase.
 
-### Phase 4 — Tests
+### Phase 4 — Tests — Done
 
-Add focused tests for:
+Added focused wrapper tests for:
 
 - `glob`
-  - finds `src/**/*.ts`
-  - respects `gitignore`
-  - includes hidden files when requested
-  - returns dirs with `/`
-  - enforces/clamps limit
-  - skips missing entries in multi-path calls
+  - [x] finds `src/**/*.ts`
+  - [x] respects `gitignore`
+  - [x] includes hidden files when requested
+  - [x] returns dirs with `/`
+  - [x] enforces/clamps limit
+  - [x] skips missing entries in multi-path calls
 - `grep`
-  - finds line matches
-  - respects case sensitivity
-  - respects gitignore
-  - handles invalid regex
-  - paginates by file with `skip`
-  - formats context lines with `*N|` and ` N|`
-  - truncates long output
+  - [x] finds line matches
+  - [x] respects case sensitivity
+  - [x] respects gitignore
+  - [x] handles invalid regex
+  - [x] paginates by file with `skip`
+  - [x] formats context lines with `*N|` and ` N|`
+  - [x] truncates long output
 
-### Phase 5 — Packaging
+Phase 4 file changes:
 
-1. Decide source-build or prebuilt before publishing.
-2. Ensure `files` includes required outputs:
-   - source-build: `src`, `native`, `README.md`, `LICENSE`
-   - prebuilt: JS loader plus platform `.node` files
-3. Add attribution/notice for copied MIT oh-my-pi code.
-4. Run a package smoke test from a packed tarball if publishing:
+- Added `test/tools.test.ts` with public tool-wrapper integration coverage.
+- Added JS regex validation in `src/tools/grep.ts` so invalid regexes surface as `Invalid regex: ...` instead of falling through to the native literal-search fallback.
+
+Validation:
+
+- `npx vitest run test/tools.test.ts` passed.
+- `npm test` passed with 14 tests.
+- `npx tsc --noEmit` passed.
+
+### Phase 5 — Packaging — Done
+
+Selected source-build packaging for this repo.
+
+Phase 5 file changes:
+
+- Updated `package.json` and `package-lock.json`:
+  - added `postinstall` to run `napi build --manifest-path native/Cargo.toml --release`
+  - moved `@napi-rs/cli` to `dependencies` so package installs can build without dev dependencies
+  - narrowed `files` to source-build inputs only, excluding `native/target`
+- Added `README.md` with source-build requirements and development commands.
+- Added `NOTICE` attribution for copied/adapted MIT oh-my-pi Rust code.
+
+Validation:
+
+- `npm run build:native` passed.
+- `npm pack --dry-run` passed and showed a 24-file, source-only package.
+
+If publishing, run a real tarball install smoke test:
 
 ```bash
 npm pack

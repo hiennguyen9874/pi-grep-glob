@@ -1,7 +1,7 @@
 {
   "name": "pi-grep-glob",
   "version": "0.1.0",
-  "description": "",
+  "description": "Pi extension that provides native-backed grep and glob tools.",
   "author": "pi-grep-glob contributors",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
@@ -15,8 +15,15 @@
   "license": "MIT",
   "files": [
     "src",
+    "native/Cargo.toml",
+    "native/Cargo.lock",
+    "native/build.rs",
+    "native/src",
+    "native/crates/pi-walker/Cargo.toml",
+    "native/crates/pi-walker/src",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "pi": {
     "extensions": [
@@ -24,6 +31,7 @@
     ]
   },
   "dependencies": {
+    "@napi-rs/cli": "^3.0.0",
     "diff": "^8.0.2",
     "file-type": "^21.3.4"
   },
@@ -36,13 +44,13 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:native": "napi build --manifest-path native/Cargo.toml --release"
+    "build:native": "napi build --manifest-path native/Cargo.toml --release",
+    "postinstall": "napi build --manifest-path native/Cargo.toml --release"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
     "@types/node": "^22.0.0",
     "ajv": "^8.20.0",
-    "vitest": "^3.0.0",
-    "@napi-rs/cli": "^3.0.0"
+    "vitest": "^3.0.0"
   }
 }

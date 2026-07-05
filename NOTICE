@@ -1,0 +1,8 @@
+pi-grep-glob
+
+This package includes Rust grep/glob and filesystem walking code copied and adapted from oh-my-pi.
+
+Upstream project: oh-my-pi
+License: MIT
+
+The copied/adapted files are under `native/src` and `native/crates/pi-walker`.
