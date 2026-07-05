@@ -1,8 +1,8 @@
 {
-  "name": "pi-shake",
+  "name": "pi-grep-glob",
   "version": "0.1.0",
   "description": "",
-  "author": "pi-shake contributors",
+  "author": "pi-grep-glob contributors",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
