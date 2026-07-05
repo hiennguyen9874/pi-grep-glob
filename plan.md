@@ -318,20 +318,40 @@ The copied Rust files are from oh-my-pi, which is MIT licensed. Keep this packag
 
 ## Implementation phases
 
-### Phase 1 — Native crate skeleton
+### Phase 1 — Native crate skeleton — Done
 
-1. Create `native/Cargo.toml` and `native/build.rs`.
-2. Create minimal `native/src/lib.rs`.
-3. Copy `pi-walker` files and adapt `Cargo.toml` away from workspace dependencies.
-4. Copy `grep.rs`, `glob.rs`, `glob_util.rs`, `iofs.rs`, and `utils.rs`.
-5. Replace `task.rs` with local implementation.
-6. Run:
+- [x] Create `native/Cargo.toml` and `native/build.rs`.
+- [x] Create minimal `native/src/lib.rs`.
+- [x] Copy `pi-walker` files and adapt `Cargo.toml` away from workspace dependencies.
+- [x] Copy `grep.rs`, `glob.rs`, `glob_util.rs`, `iofs.rs`, and `utils.rs`.
+- [x] Replace `task.rs` with local implementation.
+- [x] Run:
 
 ```bash
 cargo test --manifest-path native/Cargo.toml
 ```
 
-Success: Rust compiles and copied native unit tests pass or are intentionally trimmed only where they depend on removed oh-my-pi infrastructure.
+Success: Rust compiles and copied native unit tests pass.
+
+Phase 1 file changes:
+
+- Added `native/Cargo.toml` and `native/Cargo.lock` for the standalone native crate.
+- Added `native/build.rs` for napi-rs build setup.
+- Added `native/src/lib.rs` with only the focused grep/glob modules.
+- Added copied/adapted native modules:
+  - `native/src/grep.rs`
+  - `native/src/glob.rs`
+  - `native/src/glob_util.rs`
+  - `native/src/iofs.rs`
+  - `native/src/utils.rs`
+- Added local `native/src/task.rs` to replace oh-my-pi task/profiling/crash/shell dependencies.
+- Added vendored walker crate:
+  - `native/crates/pi-walker/Cargo.toml`
+  - `native/crates/pi-walker/src/lib.rs`
+  - `native/crates/pi-walker/src/cache.rs`
+- Adapted `native/src/grep.rs` to avoid unstable `str::floor_char_boundary` on the current Rust toolchain.
+
+Validation: `cargo test --manifest-path native/Cargo.toml` passed with 50 unit tests; the copied glob doc test is ignored.
 
 ### Phase 2 — Native loader
 
