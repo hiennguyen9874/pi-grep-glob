@@ -62,9 +62,9 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
       "Search file contents by regex or literal text. Supports file, directory, glob, or semicolon-delimited paths. Results are grouped by file and paginated with skip.",
     promptSnippet: "grep: search file contents by regex or literal text",
     promptGuidelines: [
-      "Use literal=true for exact strings that may contain regex characters.",
-      "Use glob first to narrow broad searches when possible.",
-      "Use skip to page through matching files.",
+      "Set literal=true when you want exact text, especially if the pattern includes regex characters like ., *, (, [, or ?.",
+      "Prefer the narrowest path you can; use a specific directory or glob before searching the whole workspace.",
+      "Use skip to page through more matching files; each response returns at most 20 files.",
     ],
     parameters: grepSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
