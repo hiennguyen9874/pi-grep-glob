@@ -40,8 +40,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:native": "napi build --manifest-path native/Cargo.toml --release",
-    "postinstall": "napi build --manifest-path native/Cargo.toml --release"
+    "build:native": "napi build --manifest-path native/Cargo.toml --release"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
