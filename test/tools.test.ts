@@ -124,12 +124,14 @@ describe("glob tool", () => {
       }
 
       const limited = await executeTool(createGlobTool(), { path: "*.ts", limit: 2, gitignore: false }, fixture);
-      expect(textOf(limited).split("\n")).toHaveLength(2);
+      expect(textOf(limited).split("\n").filter((line) => line && !line.startsWith("[")).length).toBe(2);
+      expect(textOf(limited)).toContain("[1 more matches omitted. Increase limit or narrow path.]");
       expect(limited.details?.limit).toBe(2);
       expect(limited.details?.returnedMatches).toBe(2);
+      expect(limited.details?.limitReached).toBe(true);
 
-      const clamped = await executeTool(createGlobTool(), { path: "*.ts", limit: 500, gitignore: false }, fixture);
-      expect(clamped.details?.limit).toBe(200);
+      const clamped = await executeTool(createGlobTool(), { path: "*.ts", limit: 5000, gitignore: false }, fixture);
+      expect(clamped.details?.limit).toBe(1000);
     });
   });
 
@@ -163,6 +165,33 @@ describe("grep tool", () => {
 
       const insensitive = await executeTool(createGrepTool(), { pattern: "hello", path: "a.txt", case: false }, fixture);
       expect(textOf(insensitive)).toContain("*1|Hello");
+    });
+  });
+
+  it("supports literal search for regex characters", async () => {
+    await withFixture(async (fixture) => {
+      await writeFile(join(fixture, "a.txt"), "abc\nfoo.bar\n");
+
+      const regex = await executeTool(createGrepTool(), { pattern: ".", path: "a.txt" }, fixture);
+      expect(regex.details?.totalMatches).toBe(2);
+
+      const literal = await executeTool(createGrepTool(), { pattern: ".", path: "a.txt", literal: true }, fixture);
+      expect(textOf(literal)).toContain("*2|foo.bar");
+      expect(literal.details?.totalMatches).toBe(1);
+    });
+  });
+
+  it("surfaces grep limit details and notice", async () => {
+    await withFixture(async (fixture) => {
+      await writeFile(join(fixture, "a.txt"), "needle\nneedle\nneedle\n");
+
+      const result = await executeTool(createGrepTool(), { pattern: "needle", path: "a.txt", limit: 2 }, fixture);
+
+      expect(result.details?.limit).toBe(2);
+      expect(result.details?.limitReached).toBe(true);
+      expect(result.details?.nativeLimitReached).toBe(true);
+      expect(result.details?.maxMatchesPerFile).toBe(2);
+      expect(textOf(result)).toContain("[Results limited: max 2 matches collected");
     });
   });
 

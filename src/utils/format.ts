@@ -23,17 +23,31 @@ export function limitText(text: string): FormattedOutput {
   };
 }
 
-export function formatGlobPaths(paths: string[], omitted = 0): FormattedOutput {
+export function formatGlobPaths(paths: string[], omitted = 0, notices: string[] = []): FormattedOutput {
   const body = paths.length > 0 ? paths.join("\n") : "No matches found.";
-  const suffix = omitted > 0 ? `\n\n[${omitted} more matches omitted. Increase limit to see more.]` : "";
+  const suffixes = [
+    omitted > 0 ? `${omitted} more matches omitted. Increase limit or narrow path.` : undefined,
+    ...notices,
+  ].filter((notice): notice is string => Boolean(notice));
+  const suffix = suffixes.length > 0 ? `\n\n${suffixes.map((notice) => `[${notice}]`).join("\n")}` : "";
   return limitText(`${body}${suffix}`);
 }
 
-export function formatGrepGroups(groups: Array<[string, GrepMatch[]]>, omittedFiles = 0): FormattedOutput {
-  if (groups.length === 0) {
-    return limitText("No matches found.");
-  }
+export function formatGrepGroups(
+  groups: Array<[string, GrepMatch[]]>,
+  omittedFiles = 0,
+  notices: string[] = [],
+): FormattedOutput {
+  const body = groups.length === 0 ? "No matches found." : formatGrepSections(groups);
+  const suffixes = [
+    omittedFiles > 0 ? `${omittedFiles} more files with matches omitted. Use skip to view more.` : undefined,
+    ...notices,
+  ].filter((notice): notice is string => Boolean(notice));
+  const suffix = suffixes.length > 0 ? `\n\n${suffixes.map((notice) => `[${notice}]`).join("\n")}` : "";
+  return limitText(`${body}${suffix}`);
+}
 
+function formatGrepSections(groups: Array<[string, GrepMatch[]]>): string {
   const sections = groups.map(([filePath, matches]) => {
     const lines = [filePath];
     for (const match of matches) {
@@ -48,8 +62,7 @@ export function formatGrepGroups(groups: Array<[string, GrepMatch[]]>, omittedFi
     return lines.join("\n");
   });
 
-  const suffix = omittedFiles > 0 ? `\n\n[${omittedFiles} more files with matches omitted. Use skip to view more.]` : "";
-  return limitText(`${sections.join("\n\n")}${suffix}`);
+  return sections.join("\n\n");
 }
 
 function formatMatchLine(match: GrepMatch): string {

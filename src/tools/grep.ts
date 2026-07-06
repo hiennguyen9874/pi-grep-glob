@@ -21,12 +21,16 @@ const FILE_PAGE_LIMIT = 20;
 const MULTI_FILE_MATCH_LIMIT = 20;
 const SINGLE_FILE_MATCH_LIMIT = 200;
 const NATIVE_MATCH_LIMIT = 2_000;
+const MAX_USER_LIMIT = 5_000;
+const MAX_COLUMNS = 500;
 
 const grepSchema = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for." }),
   path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-delimited paths to search." })),
+  literal: Type.Optional(Type.Boolean({ description: "Treat pattern as a literal string instead of a regex." })),
   case: Type.Optional(Type.Boolean({ description: "Use case-sensitive matching. Defaults to true." })),
   gitignore: Type.Optional(Type.Boolean({ description: "Respect .gitignore files. Defaults to true." })),
+  limit: Type.Optional(Type.Number({ description: "Maximum total matches to collect, clamped to 1..5000." })),
   skip: Type.Optional(Type.Number({ description: "Number of matching files to skip for pagination." })),
   contextBefore: Type.Optional(Type.Number({ description: "Lines of context before each match." })),
   contextAfter: Type.Optional(Type.Number({ description: "Lines of context after each match." })),
@@ -40,6 +44,13 @@ export interface GrepToolDetails {
   totalMatches: number;
   returnedFiles: number;
   skip: number;
+  limit: number;
+  limitReached: boolean;
+  nativeLimitReached: boolean;
+  skippedOversized: number;
+  maxMatchesPerFile: number;
+  maxReturnedFiles: number;
+  lineTruncated: boolean;
   truncation?: ReturnType<typeof formatGrepGroups>["truncation"];
 }
 
@@ -48,9 +59,13 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
     name: "grep",
     label: "Grep",
     description:
-      "Search file contents by regex. Supports file, directory, glob, or semicolon-delimited paths. Results are grouped by file and paginated with skip.",
-    promptSnippet: "grep: search file contents by regex",
-    promptGuidelines: ["Use glob first to narrow broad searches when possible.", "Use skip to page through matching files."],
+      "Search file contents by regex or literal text. Supports file, directory, glob, or semicolon-delimited paths. Results are grouped by file and paginated with skip.",
+    promptSnippet: "grep: search file contents by regex or literal text",
+    promptGuidelines: [
+      "Use literal=true for exact strings that may contain regex characters.",
+      "Use glob first to narrow broad searches when possible.",
+      "Use skip to page through matching files.",
+    ],
     parameters: grepSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
@@ -58,7 +73,21 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
         const result = await runGrep(params, cwd, signal);
         const skip = clampNonNegativeInteger(params.skip);
         const page = result.groups.slice(skip, skip + FILE_PAGE_LIMIT);
-        const formatted = formatGrepGroups(page, Math.max(0, result.groups.length - skip - page.length));
+        const omittedFiles = Math.max(0, result.groups.length - skip - page.length);
+        const lineTruncated = page.some(([, matches]) => matches.some((match) => match.truncated));
+        const limitReached = omittedFiles > 0 || result.nativeLimitReached;
+        const formatted = formatGrepGroups(
+          page,
+          omittedFiles,
+          buildGrepNotices({
+            limitReached,
+            skippedOversized: result.skippedOversized,
+            maxMatchesPerFile: result.maxMatchesPerFile,
+            maxReturnedFiles: FILE_PAGE_LIMIT,
+            lineTruncated,
+            limit: result.limit,
+          }),
+        );
 
         return {
           content: [{ type: "text", text: formatted.text }],
@@ -68,6 +97,13 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
             totalMatches: result.totalMatches,
             returnedFiles: page.length,
             skip,
+            limit: result.limit,
+            limitReached,
+            nativeLimitReached: result.nativeLimitReached,
+            skippedOversized: result.skippedOversized,
+            maxMatchesPerFile: result.maxMatchesPerFile,
+            maxReturnedFiles: FILE_PAGE_LIMIT,
+            lineTruncated,
             truncation: formatted.truncation,
           },
         };
@@ -79,14 +115,21 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
 }
 
 async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | undefined) {
-  validateRegexPattern(params.pattern);
+  validatePattern(params.pattern);
 
   const grouped = new Map<string, GrepMatch[]>();
   let filesSearched = 0;
   let totalMatches = 0;
+  let collectedMatches = 0;
+  let nativeLimitReached = false;
+  let skippedOversized = 0;
   let allEntriesMissing = true;
   const rawPaths = splitPathList(params.path);
   const singlePath = rawPaths.length === 1;
+  const userLimit = clampPositiveInteger(params.limit, MAX_USER_LIMIT);
+  const pattern = params.literal ? escapeRegex(params.pattern) : params.pattern;
+  let effectiveLimit = userLimit ?? NATIVE_MATCH_LIMIT;
+  let maxMatchesPerFile = MULTI_FILE_MATCH_LIMIT;
 
   for (const rawPath of rawPaths) {
     const spec = parsePathSpec(rawPath, cwd);
@@ -95,25 +138,41 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
     }
     allEntriesMissing = false;
 
+    const explicitSingleFile = singlePath && Boolean(spec.explicitFile);
+    const defaultLimit = explicitSingleFile ? SINGLE_FILE_MATCH_LIMIT : NATIVE_MATCH_LIMIT;
+    const maxCount = userLimit ?? defaultLimit;
+    const perFileLimit = explicitSingleFile ? maxCount : MULTI_FILE_MATCH_LIMIT;
+    effectiveLimit = maxCount;
+    maxMatchesPerFile = perFileLimit;
+
+    const remaining = maxCount - collectedMatches;
+    if (remaining <= 0) {
+      nativeLimitReached = true;
+      break;
+    }
+
     const isGlobPath = hasGlobMagic(rawPath);
     const result = await nativeGrep({
-      pattern: params.pattern,
+      pattern,
       path: spec.absoluteRoot,
       glob: isGlobPath ? spec.pattern : undefined,
       ignoreCase: !(params.case ?? true),
       hidden: true,
       gitignore: params.gitignore ?? true,
-      maxCount: singlePath && spec.explicitFile ? SINGLE_FILE_MATCH_LIMIT : NATIVE_MATCH_LIMIT,
-      maxCountPerFile: singlePath && spec.explicitFile ? SINGLE_FILE_MATCH_LIMIT : MULTI_FILE_MATCH_LIMIT,
+      maxCount: remaining,
+      maxCountPerFile: perFileLimit,
       contextBefore: clampNonNegativeInteger(params.contextBefore),
       contextAfter: clampNonNegativeInteger(params.contextAfter),
-      maxColumns: 500,
+      maxColumns: MAX_COLUMNS,
       signal,
       timeoutMs: TIMEOUT_MS,
     });
 
     filesSearched += result.filesSearched;
     totalMatches += result.totalMatches;
+    collectedMatches += result.matches.length;
+    nativeLimitReached ||= Boolean(result.limitReached);
+    skippedOversized += result.skippedOversized ?? 0;
 
     for (const match of result.matches) {
       const displayPath = normalizeMatchPath(match.path, spec.displayPrefix, cwd);
@@ -131,7 +190,34 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
     groups: [...grouped.entries()],
     filesSearched,
     totalMatches,
+    limit: effectiveLimit,
+    nativeLimitReached,
+    skippedOversized,
+    maxMatchesPerFile,
   };
+}
+
+function buildGrepNotices(options: {
+  limitReached: boolean;
+  skippedOversized: number;
+  maxMatchesPerFile: number;
+  maxReturnedFiles: number;
+  lineTruncated: boolean;
+  limit: number;
+}): string[] {
+  const notices: string[] = [];
+  if (options.limitReached) {
+    notices.push(
+      `Results limited: max ${options.limit} matches collected, showing ${options.maxReturnedFiles} files/page, ${options.maxMatchesPerFile} matches/file. Use skip or narrow path/glob.`,
+    );
+  }
+  if (options.skippedOversized > 0) {
+    notices.push(`${options.skippedOversized} oversized files were skipped or searched only by prefix.`);
+  }
+  if (options.lineTruncated) {
+    notices.push(`Some lines were truncated to ${MAX_COLUMNS} columns. Use read for full content.`);
+  }
+  return notices;
 }
 
 function normalizeMatchPath(matchPath: string, displayPrefix: string, cwd: string): string {
@@ -148,10 +234,21 @@ function clampNonNegativeInteger(value: number | undefined): number {
   return Math.max(0, Math.trunc(value));
 }
 
-function validateRegexPattern(pattern: string): void {
+function clampPositiveInteger(value: number | undefined, max: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return Math.min(max, Math.max(1, Math.trunc(value)));
+}
+
+function validatePattern(pattern: string): void {
   if (!pattern.trim()) {
     throw new Error("Pattern must not be empty");
   }
+}
+
+function escapeRegex(pattern: string): string {
+  return pattern.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
 function normalizeGrepError(error: unknown): Error {

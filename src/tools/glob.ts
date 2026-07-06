@@ -12,14 +12,14 @@ import {
 } from "../utils/path-utils.js";
 
 const DEFAULT_LIMIT = 200;
-const MAX_LIMIT = 200;
+const MAX_LIMIT = 1_000;
 const TIMEOUT_MS = 30_000;
 
 const globSchema = Type.Object({
   path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-delimited paths to find." })),
   hidden: Type.Optional(Type.Boolean({ description: "Include hidden files and directories. Defaults to true." })),
   gitignore: Type.Optional(Type.Boolean({ description: "Respect .gitignore files. Defaults to true." })),
-  limit: Type.Optional(Type.Number({ description: "Maximum paths to return, clamped to 1..200. Defaults to 200." })),
+  limit: Type.Optional(Type.Number({ description: "Maximum paths to return, clamped to 1..1000. Defaults to 200." })),
 });
 
 type GlobInput = Static<typeof globSchema>;
@@ -28,6 +28,7 @@ export interface GlobToolDetails {
   totalMatches: number;
   returnedMatches: number;
   limit: number;
+  limitReached: boolean;
   truncation?: ReturnType<typeof formatGlobPaths>["truncation"];
 }
 
@@ -44,7 +45,7 @@ export function createGlobTool(): ToolDefinition<typeof globSchema, GlobToolDeta
         const cwd = resolveCwd(ctx?.cwd);
         const limit = clampLimit(params.limit);
         const paths = await runGlob(params, cwd, signal, limit);
-        const omitted = Math.max(0, paths.totalMatches - paths.matches.length);
+        const omitted = paths.limitReached ? 1 : Math.max(0, paths.totalMatches - paths.matches.length);
         const formatted = formatGlobPaths(paths.matches, omitted);
 
         return {
@@ -53,6 +54,7 @@ export function createGlobTool(): ToolDefinition<typeof globSchema, GlobToolDeta
             totalMatches: paths.totalMatches,
             returnedMatches: paths.matches.length,
             limit,
+            limitReached: paths.limitReached,
             truncation: formatted.truncation,
           },
         };
@@ -65,13 +67,11 @@ export function createGlobTool(): ToolDefinition<typeof globSchema, GlobToolDeta
 
 async function runGlob(params: GlobInput, cwd: string, signal: AbortSignal | undefined, limit: number) {
   const matches: string[] = [];
+  const seen = new Set<string>();
   let allEntriesMissing = true;
+  let limitReached = false;
 
   for (const rawPath of splitPathList(params.path)) {
-    if (matches.length >= limit) {
-      break;
-    }
-
     const spec = parsePathSpec(rawPath, cwd);
     if (spec.missing) {
       continue;
@@ -79,18 +79,23 @@ async function runGlob(params: GlobInput, cwd: string, signal: AbortSignal | und
     allEntriesMissing = false;
 
     if (spec.explicitFile) {
-      matches.push(normalizeOutputPath(spec.explicitFile));
+      const displayPath = normalizeOutputPath(spec.explicitFile);
+      if (matches.length >= limit && !seen.has(displayPath)) {
+        limitReached = true;
+        break;
+      }
+      addUniqueMatch(matches, seen, displayPath);
       continue;
     }
 
-    const remaining = limit - matches.length;
+    const remaining = Math.max(0, limit - matches.length);
     const result = await nativeGlob({
       pattern: spec.pattern ?? "*",
       path: spec.absoluteRoot,
       fileType: undefined,
       recursive: false,
       hidden: params.hidden ?? true,
-      maxResults: remaining,
+      maxResults: remaining + 1,
       gitignore: params.gitignore ?? true,
       cache: true,
       sortByMtime: true,
@@ -100,7 +105,15 @@ async function runGlob(params: GlobInput, cwd: string, signal: AbortSignal | und
 
     for (const match of result.matches) {
       const suffix = match.fileType === FileType.Dir ? "/" : "";
-      matches.push(joinDisplayPath(spec.displayPrefix, `${match.path}${suffix}`));
+      addUniqueMatch(matches, seen, joinDisplayPath(spec.displayPrefix, `${match.path}${suffix}`));
+      if (matches.length > limit) {
+        limitReached = true;
+        break;
+      }
+    }
+
+    if (limitReached) {
+      break;
     }
   }
 
@@ -108,11 +121,20 @@ async function runGlob(params: GlobInput, cwd: string, signal: AbortSignal | und
     throw new Error(`Path not found: ${params.path ?? "."}`);
   }
 
-  const uniqueMatches = [...new Set(matches)];
+  const returned = matches.slice(0, limit);
   return {
-    matches: uniqueMatches.slice(0, limit),
-    totalMatches: uniqueMatches.length + Math.max(0, matches.length - uniqueMatches.length),
+    matches: returned,
+    totalMatches: returned.length + (limitReached ? 1 : 0),
+    limitReached,
   };
+}
+
+function addUniqueMatch(matches: string[], seen: Set<string>, match: string): void {
+  if (seen.has(match)) {
+    return;
+  }
+  seen.add(match);
+  matches.push(match);
 }
 
 function clampLimit(value: number | undefined): number {
