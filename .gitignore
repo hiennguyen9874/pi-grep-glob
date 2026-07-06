@@ -179,4 +179,7 @@ pi-fff/
 test.json
 native.json
 examples
-native/target
+
+# Native build output
+native/target/
+native/index.node

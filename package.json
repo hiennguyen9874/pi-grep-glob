@@ -15,6 +15,7 @@
   "license": "MIT",
   "files": [
     "src",
+    "native/*.node",
     "native/Cargo.toml",
     "native/Cargo.lock",
     "native/build.rs",
@@ -40,7 +41,9 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:native": "napi build --manifest-path native/Cargo.toml --release"
+    "build:native": "napi build --manifest-path native/Cargo.toml --release",
+    "copy:native": "node scripts/copy-native-addon.mjs",
+    "build:native:package": "npm run build:native && npm run copy:native"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
