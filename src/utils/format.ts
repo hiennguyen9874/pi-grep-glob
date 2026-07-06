@@ -26,7 +26,7 @@ export function limitText(text: string): FormattedOutput {
 export function formatGlobPaths(paths: string[], omitted = 0, notices: string[] = []): FormattedOutput {
   const body = paths.length > 0 ? paths.join("\n") : "No matches found.";
   const suffixes = [
-    omitted > 0 ? `${omitted} more matches omitted. Increase limit or narrow path.` : undefined,
+    omitted > 0 ? "More matches omitted. Increase limit or narrow path." : undefined,
     ...notices,
   ].filter((notice): notice is string => Boolean(notice));
   const suffix = suffixes.length > 0 ? `\n\n${suffixes.map((notice) => `[${notice}]`).join("\n")}` : "";

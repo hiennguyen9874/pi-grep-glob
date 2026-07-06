@@ -30,7 +30,7 @@ const grepSchema = Type.Object({
   literal: Type.Optional(Type.Boolean({ description: "Treat pattern as a literal string instead of a regex." })),
   case: Type.Optional(Type.Boolean({ description: "Use case-sensitive matching. Defaults to true." })),
   gitignore: Type.Optional(Type.Boolean({ description: "Respect .gitignore files. Defaults to true." })),
-  limit: Type.Optional(Type.Number({ description: "Maximum total matches to collect, clamped to 1..5000." })),
+  limit: Type.Optional(Type.Number({ description: "Maximum total matches to collect across all files, not files returned; clamped to 1..5000." })),
   skip: Type.Optional(Type.Number({ description: "Number of matching files to skip for pagination." })),
   contextBefore: Type.Optional(Type.Number({ description: "Lines of context before each match." })),
   contextAfter: Type.Optional(Type.Number({ description: "Lines of context after each match." })),

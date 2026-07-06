@@ -125,7 +125,7 @@ describe("glob tool", () => {
 
       const limited = await executeTool(createGlobTool(), { path: "*.ts", limit: 2, gitignore: false }, fixture);
       expect(textOf(limited).split("\n").filter((line) => line && !line.startsWith("[")).length).toBe(2);
-      expect(textOf(limited)).toContain("[1 more matches omitted. Increase limit or narrow path.]");
+      expect(textOf(limited)).toContain("[More matches omitted. Increase limit or narrow path.]");
       expect(limited.details?.limit).toBe(2);
       expect(limited.details?.returnedMatches).toBe(2);
       expect(limited.details?.limitReached).toBe(true);
