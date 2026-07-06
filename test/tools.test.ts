@@ -143,6 +143,18 @@ describe("glob tool", () => {
       expect(textOf(result)).toBe("found.ts");
     });
   });
+
+  it("supports whitespace-delimited path lists", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "src"));
+      await mkdir(join(fixture, "test"));
+      await writeFile(join(fixture, "src", "index.ts"), "src\n");
+      await writeFile(join(fixture, "test", "index.ts"), "test\n");
+
+      const result = await executeTool(createGlobTool(), { path: "src test", gitignore: false }, fixture);
+      expect(textOf(result).split("\n").sort()).toEqual(["src/index.ts", "test/index.ts"]);
+    });
+  });
 });
 
 describe("grep tool", () => {
@@ -153,6 +165,19 @@ describe("grep tool", () => {
       const result = await executeTool(createGrepTool(), { pattern: "target", path: "a.txt" }, fixture);
       expect(textOf(result)).toContain("a.txt\n*2|target line");
       expect(result.details?.totalMatches).toBe(1);
+    });
+  });
+
+  it("supports whitespace-delimited path lists", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "src"));
+      await mkdir(join(fixture, "test"));
+      await writeFile(join(fixture, "src", "index.ts"), "needle in src\n");
+      await writeFile(join(fixture, "test", "index.ts"), "needle in test\n");
+
+      const result = await executeTool(createGrepTool(), { pattern: "needle", path: "src test" }, fixture);
+      expect(textOf(result)).toContain("src/index.ts\n*1|needle in src");
+      expect(textOf(result)).toContain("test/index.ts\n*1|needle in test");
     });
   });
 

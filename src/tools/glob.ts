@@ -16,7 +16,7 @@ const MAX_LIMIT = 1_000;
 const TIMEOUT_MS = 30_000;
 
 const globSchema = Type.Object({
-  path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-delimited paths to find." })),
+  path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-/whitespace-delimited paths to find." })),
   hidden: Type.Optional(Type.Boolean({ description: "Include hidden files and directories. Defaults to true." })),
   gitignore: Type.Optional(Type.Boolean({ description: "Respect .gitignore files. Defaults to true." })),
   limit: Type.Optional(Type.Number({ description: "Maximum paths to return, clamped to 1..1000. Defaults to 200." })),
@@ -37,7 +37,7 @@ export function createGlobTool(): ToolDefinition<typeof globSchema, GlobToolDeta
     name: "glob",
     label: "Glob",
     description:
-      "Find files and directories by file path, directory, glob pattern, or semicolon-delimited path list. Directories end with '/'.",
+      "Find files and directories by file path, directory, glob pattern, or semicolon-/whitespace-delimited path list. Directories end with '/'.",
     promptSnippet: "glob: find files/directories by path or glob pattern",
     parameters: globSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -71,7 +71,7 @@ async function runGlob(params: GlobInput, cwd: string, signal: AbortSignal | und
   let allEntriesMissing = true;
   let limitReached = false;
 
-  for (const rawPath of splitPathList(params.path)) {
+  for (const rawPath of splitPathList(params.path, cwd)) {
     const spec = parsePathSpec(rawPath, cwd);
     if (spec.missing) {
       continue;

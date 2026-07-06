@@ -11,12 +11,26 @@ export interface PathSpec {
 
 const GLOB_CHARS = new Set(["*", "?", "[", "]", "{", "}"]);
 
-export function splitPathList(value: string | undefined): string[] {
+export function splitPathList(value: string | undefined, cwd?: string): string[] {
   const pathValue = value?.trim() || ".";
+  const delimiter = pathValue.includes(";") ? /;/ : shouldSplitWhitespacePathList(pathValue, cwd) ? /\s+/ : undefined;
+  if (!delimiter) {
+    return [pathValue];
+  }
   return pathValue
-    .split(";")
+    .split(delimiter)
     .map((part) => part.trim())
     .filter(Boolean);
+}
+
+function shouldSplitWhitespacePathList(pathValue: string, cwd: string | undefined): boolean {
+  if (!/\s/.test(pathValue)) {
+    return false;
+  }
+  if (!cwd) {
+    return true;
+  }
+  return !existsSync(path.resolve(cwd, pathValue));
 }
 
 export function resolveCwd(cwd: string | undefined): string {

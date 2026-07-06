@@ -26,7 +26,7 @@ const MAX_COLUMNS = 500;
 
 const grepSchema = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for." }),
-  path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-delimited paths to search." })),
+  path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-/whitespace-delimited paths to search." })),
   literal: Type.Optional(Type.Boolean({ description: "Treat pattern as a literal string instead of a regex." })),
   case: Type.Optional(Type.Boolean({ description: "Use case-sensitive matching. Defaults to true." })),
   gitignore: Type.Optional(Type.Boolean({ description: "Respect .gitignore files. Defaults to true." })),
@@ -59,7 +59,7 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
     name: "grep",
     label: "Grep",
     description:
-      "Search file contents by regex or literal text. Supports file, directory, glob, or semicolon-delimited paths. Results are grouped by file and paginated with skip.",
+      "Search file contents by regex or literal text. Supports file, directory, glob, or semicolon-/whitespace-delimited paths. Results are grouped by file and paginated with skip.",
     promptSnippet: "grep: search file contents by regex or literal text",
     promptGuidelines: [
       "Set literal=true when you want exact text, especially if the pattern includes regex characters like ., *, (, [, or ?.",
@@ -124,7 +124,7 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
   let nativeLimitReached = false;
   let skippedOversized = 0;
   let allEntriesMissing = true;
-  const rawPaths = splitPathList(params.path);
+  const rawPaths = splitPathList(params.path, cwd);
   const singlePath = rawPaths.length === 1;
   const userLimit = clampPositiveInteger(params.limit, MAX_USER_LIMIT);
   const pattern = params.literal ? escapeRegex(params.pattern) : params.pattern;

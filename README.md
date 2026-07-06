@@ -9,7 +9,7 @@ Both tools accept a single `path` string that can be:
 - a file path
 - a directory path
 - a glob pattern
-- a semicolon-delimited path list like `src/**/*.ts;test/**/*.ts`
+- a semicolon- or whitespace-delimited path list like `src/**/*.ts;test/**/*.ts` or `src test`
 
 Defaults are aimed at code search:
 
@@ -46,6 +46,12 @@ Search multiple globs in one call:
 
 ```json
 { "path": "src/**/*.ts;test/**/*.ts" }
+```
+
+Search multiple directories in one call:
+
+```json
+{ "path": "src test" }
 ```
 
 List everything under `src` while ignoring `.gitignore` rules:
