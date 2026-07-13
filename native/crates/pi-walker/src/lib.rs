@@ -24,7 +24,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicBool, Ordering as AtomicOrdering},
+		atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
 	},
 };
 
@@ -212,6 +212,142 @@ impl Hash for CompiledWalkGlob {
 	}
 }
 
+/// Error returned when a walk glob or exclusion pattern cannot be compiled.
+#[derive(Debug)]
+pub struct WalkPatternError {
+	pattern: String,
+	source:  globset::Error,
+}
+
+impl WalkPatternError {
+	fn new(pattern: impl Into<String>, source: globset::Error) -> Self {
+		Self { pattern: pattern.into(), source }
+	}
+
+	/// Return the pattern that failed compilation.
+	pub fn pattern(&self) -> &str {
+		&self.pattern
+	}
+}
+
+impl fmt::Display for WalkPatternError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "invalid walk pattern '{}': {}", self.pattern, self.source)
+	}
+}
+
+impl std::error::Error for WalkPatternError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.source)
+	}
+}
+
+/// Compiled exclusion globs for normalized walk-relative paths.
+///
+/// Patterns are relative to the traversal root. A pattern ending in `/**`
+/// also compiles an exact directory matcher so that the directory can be
+/// pruned before it is descended into.
+#[derive(Clone)]
+pub struct CompiledWalkExcludes {
+	patterns:              Arc<[String]>,
+	matcher:               Arc<GlobSet>,
+	prunable_directories: Arc<GlobSet>,
+}
+
+impl CompiledWalkExcludes {
+	/// Compile exclusion globs for walk-relative paths.
+	pub fn new<P, I>(patterns: I) -> Result<Self, WalkPatternError>
+	where
+		P: Into<String>,
+		I: IntoIterator<Item = P>,
+	{
+		let mut normalized_patterns = Vec::new();
+		let mut matcher_builder = GlobSetBuilder::new();
+		let mut prune_builder = GlobSetBuilder::new();
+		let mut prune_patterns = Vec::new();
+		for pattern in patterns {
+			let pattern = pattern.into();
+			let glob = GlobBuilder::new(&pattern)
+				.literal_separator(true)
+				.build()
+				.map_err(|source| WalkPatternError::new(pattern.clone(), source))?;
+			matcher_builder.add(glob);
+			if let Some(directory_pattern) = pattern.strip_suffix("/**")
+				&& !directory_pattern.is_empty()
+			{
+				let glob = GlobBuilder::new(directory_pattern)
+					.literal_separator(true)
+					.build()
+					.map_err(|source| WalkPatternError::new(pattern.clone(), source))?;
+				prune_builder.add(glob);
+				let descendant_glob = GlobBuilder::new(&pattern)
+					.literal_separator(true)
+					.build()
+					.map_err(|source| WalkPatternError::new(pattern.clone(), source))?;
+				prune_builder.add(descendant_glob);
+				prune_patterns.push(directory_pattern.to_string());
+			}
+			normalized_patterns.push(pattern);
+		}
+		let matcher = matcher_builder
+			.build()
+			.map_err(|source| WalkPatternError::new("<exclusions>", source))?;
+		let prunable_directories = prune_builder
+			.build()
+			.map_err(|source| WalkPatternError::new(
+				prune_patterns.last().map_or("<exclusions>", String::as_str),
+				source,
+			))?;
+		Ok(Self {
+			patterns: normalized_patterns.into(),
+			matcher: Arc::new(matcher),
+			prunable_directories: Arc::new(prunable_directories),
+		})
+	}
+
+	/// Return whether `relative` matches an exclusion pattern.
+	pub fn is_match(&self, relative: &str) -> bool {
+		self.matcher.is_match(relative) || self.prunable_directories.is_match(relative)
+	}
+
+	/// Return whether `relative` is an excluded directory that can be pruned.
+	pub fn prunes_directory(&self, relative: &str) -> bool {
+		self.prunable_directories.is_match(relative)
+			|| self.patterns.iter().any(|pattern| {
+				pattern
+					.strip_suffix("/**")
+					.is_some_and(|directory| relative == directory || is_relative_ancestor(directory, relative))
+			})
+	}
+
+	/// Return the patterns backing this compiled exclusion set.
+	pub fn patterns(&self) -> &[String] {
+		&self.patterns
+	}
+}
+
+impl fmt::Debug for CompiledWalkExcludes {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("CompiledWalkExcludes")
+			.field("patterns", &self.patterns)
+			.finish()
+	}
+}
+
+impl PartialEq for CompiledWalkExcludes {
+	fn eq(&self, other: &Self) -> bool {
+		self.patterns == other.patterns
+	}
+}
+
+impl Eq for CompiledWalkExcludes {}
+
+impl Hash for CompiledWalkExcludes {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.patterns.hash(state);
+	}
+}
+
 /// High-level entry filter applied by collection and streaming APIs.
 #[derive(Clone)]
 pub struct WalkFilter {
@@ -220,6 +356,8 @@ pub struct WalkFilter {
 	skip_node_modules_unless_seen: bool,
 	mentions_node_modules: bool,
 	glob: Option<CompiledWalkGlob>,
+	excludes: Option<CompiledWalkExcludes>,
+	explicit_files: Arc<[String]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -243,6 +381,8 @@ impl fmt::Debug for WalkFilter {
 			.field("skip_node_modules_unless_seen", &self.skip_node_modules_unless_seen)
 			.field("mentions_node_modules", &self.mentions_node_modules)
 			.field("glob", &self.glob)
+			.field("excludes", &self.excludes)
+			.field("explicit_files", &self.explicit_files)
 			.finish()
 	}
 }
@@ -254,6 +394,8 @@ impl PartialEq for WalkFilter {
 			&& self.skip_node_modules_unless_seen == other.skip_node_modules_unless_seen
 			&& self.mentions_node_modules == other.mentions_node_modules
 			&& self.glob == other.glob
+			&& self.excludes == other.excludes
+			&& self.explicit_files == other.explicit_files
 	}
 }
 
@@ -266,40 +408,48 @@ impl Hash for WalkFilter {
 		self.skip_node_modules_unless_seen.hash(state);
 		self.mentions_node_modules.hash(state);
 		self.glob.hash(state);
+		self.excludes.hash(state);
+		self.explicit_files.hash(state);
 	}
 }
 
 impl WalkFilter {
 	/// Return a filter that accepts files and directories.
-	pub const fn all() -> Self {
+	pub fn all() -> Self {
 		Self {
 			kind: WalkFilterKind::All,
 			max_file_size: None,
 			skip_node_modules_unless_seen: false,
 			mentions_node_modules: false,
 			glob: None,
+			excludes: None,
+			explicit_files: Arc::from([]),
 		}
 	}
 
 	/// Return a filter that emits only regular files.
-	pub const fn files_only() -> Self {
+	pub fn files_only() -> Self {
 		Self {
 			kind: WalkFilterKind::Files,
 			max_file_size: None,
 			skip_node_modules_unless_seen: false,
 			mentions_node_modules: false,
 			glob: None,
+			excludes: None,
+			explicit_files: Arc::from([]),
 		}
 	}
 
 	/// Return a filter that emits only directories.
-	pub const fn dirs_only() -> Self {
+	pub fn dirs_only() -> Self {
 		Self {
 			kind: WalkFilterKind::Dirs,
 			max_file_size: None,
 			skip_node_modules_unless_seen: false,
 			mentions_node_modules: false,
 			glob: None,
+			excludes: None,
+			explicit_files: Arc::from([]),
 		}
 	}
 
@@ -322,6 +472,47 @@ impl WalkFilter {
 		self
 	}
 
+	/// Exclude entries matching `excludes`, pruning directory patterns ending in `/**`.
+	pub fn exclude(mut self, excludes: CompiledWalkExcludes) -> Self {
+		self.excludes = Some(excludes);
+		self
+	}
+
+	/// Allow an explicitly requested file to bypass exclusion patterns.
+	pub fn explicit_file(mut self, relative_path: impl Into<String>) -> Self {
+		let mut files = self.explicit_files.to_vec();
+		files.push(relative_path.into());
+		self.explicit_files = files.into();
+		self
+	}
+
+	/// Allow explicitly requested files to bypass exclusion patterns.
+	pub fn explicit_files<I, P>(mut self, relative_paths: I) -> Self
+	where
+		I: IntoIterator<Item = P>,
+		P: Into<String>,
+	{
+		self.explicit_files = relative_paths.into_iter().map(Into::into).collect();
+		self
+	}
+
+	/// Return whether this filter needs to be applied during traversal.
+	fn requires_streaming_scan(&self) -> bool {
+		self.excludes.is_some()
+	}
+
+	fn is_explicit_file(&self, relative_path: &str, file_type: FileType) -> bool {
+		file_type == FileType::File
+			&& self.explicit_files.iter().any(|path| path == relative_path)
+	}
+
+	fn has_explicit_file_below(&self, relative_path: &str) -> bool {
+		self
+			.explicit_files
+			.iter()
+			.any(|path| is_relative_ancestor(relative_path, path))
+	}
+
 	fn accepts_path(&self, relative_path: &str) -> bool {
 		self
 			.glob
@@ -330,6 +521,12 @@ impl WalkFilter {
 	}
 
 	fn accepts_collected(&self, entry: &CollectedEntry) -> bool {
+		if !self.is_explicit_file(&entry.path, entry.file_type)
+			&& let Some(excludes) = &self.excludes
+			&& excludes.is_match(&entry.path)
+		{
+			return false;
+		}
 		if self.skip_node_modules_unless_seen
 			&& !self.mentions_node_modules
 			&& entry
@@ -353,6 +550,19 @@ impl WalkFilter {
 	}
 
 	fn stream_decision(&self, meta: &EntryMeta<'_>) -> WalkDecision {
+		if !self.is_explicit_file(meta.relative_path, meta.file_type)
+			&& let Some(excludes) = &self.excludes
+		{
+			if meta.file_type == FileType::Dir && excludes.prunes_directory(meta.relative_path) {
+				if self.has_explicit_file_below(meta.relative_path) {
+					return WalkDecision::Skip;
+				}
+				return WalkDecision::SkipDescend;
+			}
+			if excludes.is_match(meta.relative_path) {
+				return WalkDecision::Skip;
+			}
+		}
 		if self.skip_node_modules_unless_seen
 			&& !self.mentions_node_modules
 			&& meta
@@ -521,13 +731,17 @@ pub enum WalkRank {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WalkStats {
 	/// Age of the cache entry in milliseconds; zero means freshly scanned.
-	pub cache_age_ms:     u64,
-	/// Entries before high-level filtering.
-	pub scanned_entries:  usize,
+	pub cache_age_ms:        u64,
+	/// Entries encountered before positive filtering.
+	pub scanned_entries:     usize,
 	/// Entries removed by high-level filtering.
-	pub filtered_entries: usize,
-	/// Entries removed by the high-level limit.
-	pub limited_entries:  usize,
+	pub filtered_entries:    usize,
+	/// Entries omitted by the high-level limit. For a bounded streaming scan,
+	/// this is at least one when traversal found another accepted entry after
+	/// the returned limit.
+	pub limited_entries:     usize,
+	/// Whether the optional scan budget stopped traversal.
+	pub scan_limit_reached:  bool,
 }
 
 /// Owned entries and metadata returned by [`WalkRequest::collect`].
@@ -603,6 +817,7 @@ pub struct WalkRequest {
 	cache_policy:     CachePolicy,
 	filter:           WalkFilter,
 	limit:            Option<usize>,
+	scan_limit:       Option<usize>,
 	empty_recheck:    EmptyRecheck,
 	visit_order:      VisitOrder,
 	size_hint_policy: SizeHintPolicy,
@@ -632,6 +847,7 @@ impl WalkRequest {
 			cache_policy,
 			filter: WalkFilter::default(),
 			limit: None,
+			scan_limit: None,
 			empty_recheck: EmptyRecheck::Configured,
 			visit_order,
 			size_hint_policy: SizeHintPolicy::FromDetail,
@@ -741,6 +957,37 @@ impl WalkRequest {
 	/// Remove any high-level entry limit.
 	pub const fn no_limit(mut self) -> Self {
 		self.limit = None;
+		self
+	}
+
+	/// Limit entries encountered before positive filtering.
+	pub const fn scan_limit(mut self, scan_limit: usize) -> Self {
+		self.scan_limit = Some(scan_limit);
+		self
+	}
+
+	/// Remove the scan budget.
+	pub const fn no_scan_limit(mut self) -> Self {
+		self.scan_limit = None;
+		self
+	}
+
+	/// Add an explicitly requested file that bypasses exclusion patterns.
+	pub fn explicit_file(mut self, path: impl AsRef<Path>) -> Self {
+		let relative = normalize_request_relative_path(&self.root, path.as_ref());
+		self.filter = self.filter.explicit_file(relative);
+		self
+	}
+
+	/// Add explicitly requested files that bypass exclusion patterns.
+	pub fn explicit_files<I, P>(mut self, paths: I) -> Self
+	where
+		I: IntoIterator<Item = P>,
+		P: AsRef<Path>,
+	{
+		for path in paths {
+			self = self.explicit_file(path);
+		}
 		self
 	}
 
@@ -993,7 +1240,14 @@ impl WalkRequest {
 			visitor,
 			predicate,
 		};
-		walk_entries(&self.root, options, &mut adapter, &mut heartbeat)
+		walk_entries_with_stats(
+			&self.root,
+			options,
+			self.scan_limit,
+			&mut adapter,
+			&mut heartbeat,
+		)
+		.map(|(status, _)| status)
 	}
 
 	/// Run `operation` for each accepted regular file.
@@ -1073,7 +1327,20 @@ impl WalkRequest {
 	where
 		E: Send,
 	{
-		run_file_candidate_parallel(self, &sink, &heartbeat)
+		self.for_each_file_candidate_parallel_with_stats(sink, heartbeat)
+			.map(|(status, _)| status)
+	}
+
+	/// Visit candidates in parallel and return scan-budget statistics.
+	pub fn for_each_file_candidate_parallel_with_stats<E>(
+		&self,
+		sink: impl Fn(&FileCandidate) -> std::result::Result<ParallelWalkControl, E> + Send + Sync,
+		heartbeat: impl Fn() -> std::result::Result<(), E> + Send + Sync,
+	) -> std::result::Result<(WalkStatus, WalkStats), WalkError<E>>
+	where
+		E: Send,
+	{
+		run_file_candidate_parallel_with_stats(self, &sink, &heartbeat)
 	}
 
 	fn collect_with_rank_and_limit<E, H>(
@@ -1090,7 +1357,13 @@ impl WalkRequest {
 		if matches!(rank, Some(WalkRank::MtimeDescPathAsc)) {
 			options.detail = WalkDetail::Full;
 		}
-		let mut scan = self.collect_entries_with_options(options, &heartbeat)?;
+		let use_streaming_scan = self.filter.requires_streaming_scan() || self.scan_limit.is_some();
+		let collection_limit = if rank.is_none() { limit } else { None };
+		let mut scan = if use_streaming_scan {
+			self.collect_filtered_entries_with_options(options, collection_limit, &heartbeat)?
+		} else {
+			self.collect_entries_with_options(options, &heartbeat)?
+		};
 		let mut backend = if scan.cache_age_ms == 0 {
 			WalkBackend::Fresh
 		} else {
@@ -1101,12 +1374,30 @@ impl WalkRequest {
 			entries.retain(|entry| self.filter.accepts_collected(entry));
 			(scanned_entries, scanned_entries - entries.len())
 		};
-		let (mut scanned_entries, mut filtered_entries) = filter_entries(&mut scan.entries);
+		let (mut scanned_entries, mut filtered_entries) = if use_streaming_scan {
+			(
+				scan.traversal_stats.scanned_entries,
+				scan.traversal_stats.scanned_entries.saturating_sub(scan.entries.len()),
+			)
+		} else {
+			filter_entries(&mut scan.entries)
+		};
 		if scan.entries.is_empty() && self.should_recheck_empty(scan.cache_age_ms) {
 			options.cache = false;
-			scan = self.collect_entries_with_options(options, &heartbeat)?;
+			scan = if use_streaming_scan {
+				self.collect_filtered_entries_with_options(options, collection_limit, &heartbeat)?
+			} else {
+				self.collect_entries_with_options(options, &heartbeat)?
+			};
 			backend = WalkBackend::Fresh;
-			(scanned_entries, filtered_entries) = filter_entries(&mut scan.entries);
+			(scanned_entries, filtered_entries) = if use_streaming_scan {
+				(
+					scan.traversal_stats.scanned_entries,
+					scan.traversal_stats.scanned_entries.saturating_sub(scan.entries.len()),
+				)
+			} else {
+				filter_entries(&mut scan.entries)
+			};
 		}
 		if let Some(rank) = rank {
 			Self::rank_entries(&mut scan.entries, rank);
@@ -1114,7 +1405,11 @@ impl WalkRequest {
 		let limited_entries = if let Some(limit) = limit {
 			let limited_entries = scan.entries.len().saturating_sub(limit);
 			scan.entries.truncate(limit);
-			limited_entries
+			if scan.traversal_stats.result_limit_reached {
+				limited_entries.max(1)
+			} else {
+				limited_entries
+			}
 		} else {
 			0
 		};
@@ -1123,6 +1418,7 @@ impl WalkRequest {
 			scanned_entries,
 			filtered_entries,
 			limited_entries,
+			scan_limit_reached: scan.traversal_stats.scan_limit_reached,
 		};
 		Ok(WalkOutcome { entries: scan.entries, backend, stats })
 	}
@@ -1176,6 +1472,39 @@ impl WalkRequest {
 		E: fmt::Display,
 	{
 		collect_entries(&self.root, options, heartbeat)
+	}
+
+	fn collect_filtered_entries_with_options<E, H>(
+		&self,
+		mut options: WalkOptions,
+		limit: Option<usize>,
+		heartbeat: &H,
+	) -> std::result::Result<CollectedEntries, WalkError<String>>
+	where
+		H: Fn() -> std::result::Result<(), E> + Sync,
+		E: fmt::Display,
+	{
+		options.cache = false;
+		let mut visitor = FilteredCollectVisitor {
+			filter: &self.filter,
+			limit,
+			emitted: 0,
+			entries: Vec::new(),
+		};
+		let (status, mut traversal_stats) = walk_entries_with_stats(
+			&self.root,
+			options,
+			self.scan_limit,
+			&mut visitor,
+			|| heartbeat().map_err(|error| error.to_string()),
+		)?;
+		traversal_stats.result_limit_reached =
+			status == WalkStatus::Stopped && !traversal_stats.scan_limit_reached;
+		Ok(CollectedEntries {
+			entries: visitor.entries,
+			cache_age_ms: 0,
+			traversal_stats,
+		})
 	}
 
 	fn should_recheck_empty(&self, cache_age_ms: u64) -> bool {
@@ -1297,15 +1626,50 @@ struct ParallelWalkContext {
 }
 
 struct ParallelWalkShared<'a, E, S, H> {
-	stop:      AtomicBool,
-	error:     Mutex<Option<E>>,
-	sink:      &'a S,
-	heartbeat: &'a H,
+	stop:               AtomicBool,
+	scan_limit_reached: AtomicBool,
+	scanned_entries:    AtomicUsize,
+	scan_limit:         Option<usize>,
+	error:              Mutex<Option<E>>,
+	sink:               &'a S,
+	heartbeat:          &'a H,
 }
 
 impl<'a, E, S, H> ParallelWalkShared<'a, E, S, H> {
-	const fn new(sink: &'a S, heartbeat: &'a H) -> Self {
-		Self { stop: AtomicBool::new(false), error: Mutex::new(None), sink, heartbeat }
+	const fn new(sink: &'a S, heartbeat: &'a H, scan_limit: Option<usize>) -> Self {
+		Self {
+			stop: AtomicBool::new(false),
+			scan_limit_reached: AtomicBool::new(false),
+			scanned_entries: AtomicUsize::new(0),
+			scan_limit,
+			error: Mutex::new(None),
+			sink,
+			heartbeat,
+		}
+	}
+
+	fn count_scanned_entry(&self) -> bool {
+		let Some(limit) = self.scan_limit else {
+			self.scanned_entries.fetch_add(1, AtomicOrdering::Relaxed);
+			return true;
+		};
+		let mut current = self.scanned_entries.load(AtomicOrdering::Relaxed);
+		loop {
+			if current >= limit {
+				self.scan_limit_reached.store(true, AtomicOrdering::Release);
+				self.request_stop();
+				return false;
+			}
+			match self.scanned_entries.compare_exchange_weak(
+				current,
+				current + 1,
+				AtomicOrdering::Relaxed,
+				AtomicOrdering::Relaxed,
+			) {
+				Ok(_) => return true,
+				Err(actual) => current = actual,
+			}
+		}
 	}
 
 	fn request_stop(&self) {
@@ -1344,11 +1708,21 @@ fn should_use_parallel_file_candidate_walk(options: WalkOptions) -> bool {
 	walk_workers() > 1 && options.follow_links == FollowLinks::Never && !options.same_file_system
 }
 
-fn run_file_candidate_parallel<E, S, H>(
+const fn empty_walk_stats() -> WalkStats {
+	WalkStats {
+		cache_age_ms: 0,
+		scanned_entries: 0,
+		filtered_entries: 0,
+		limited_entries: 0,
+		scan_limit_reached: false,
+	}
+}
+
+fn run_file_candidate_parallel_with_stats<E, S, H>(
 	request: &WalkRequest,
 	sink: &S,
 	heartbeat: &H,
-) -> std::result::Result<WalkStatus, WalkError<E>>
+) -> std::result::Result<(WalkStatus, WalkStats), WalkError<E>>
 where
 	E: Send,
 	S: Fn(&FileCandidate) -> std::result::Result<ParallelWalkControl, E> + Sync,
@@ -1356,7 +1730,7 @@ where
 {
 	let mut options = request.effective_options();
 	if options.min_depth > options.max_depth {
-		return Ok(WalkStatus::Complete);
+		return Ok((WalkStatus::Complete, empty_walk_stats()));
 	}
 	heartbeat().map_err(WalkError::Interrupted)?;
 	if !should_use_parallel_file_candidate_walk(options) {
@@ -1365,7 +1739,7 @@ where
 
 	options.cache = false;
 	let Some(root_entry) = root_entry(&request.root, options.detail, options.follow_links)? else {
-		return Ok(WalkStatus::Complete);
+		return Ok((WalkStatus::Complete, empty_walk_stats()));
 	};
 	let context = ParallelWalkContext {
 		root: request.root.clone(),
@@ -1374,7 +1748,7 @@ where
 		matcher: FastIgnore::new(options.use_gitignore),
 	};
 	let root_ignore = context.matcher.root_state(&context.root);
-	let shared = ParallelWalkShared::new(sink, heartbeat);
+	let shared = ParallelWalkShared::new(sink, heartbeat, request.scan_limit);
 
 	if root_entry.file_type == FileType::File && options.min_depth == 0 {
 		emit_parallel_root_file(&context, &shared, &root_entry);
@@ -1401,10 +1775,22 @@ where
 
 	if let Some(error) = shared.take_error() {
 		Err(WalkError::Interrupted(error))
-	} else if shared.should_stop() {
-		Ok(WalkStatus::Stopped)
 	} else {
-		Ok(WalkStatus::Complete)
+		let status = if shared.should_stop() {
+			WalkStatus::Stopped
+		} else {
+			WalkStatus::Complete
+		};
+		Ok((
+			status,
+			WalkStats {
+				cache_age_ms: 0,
+				scanned_entries: shared.scanned_entries.load(AtomicOrdering::Acquire),
+				filtered_entries: 0,
+				limited_entries: 0,
+				scan_limit_reached: shared.scan_limit_reached.load(AtomicOrdering::Acquire),
+			},
+		))
 	}
 }
 
@@ -1413,7 +1799,7 @@ fn run_file_candidate_serial<E, S, H>(
 	mut options: WalkOptions,
 	sink: &S,
 	heartbeat: &H,
-) -> std::result::Result<WalkStatus, WalkError<E>>
+) -> std::result::Result<(WalkStatus, WalkStats), WalkError<E>>
 where
 	S: Fn(&FileCandidate) -> std::result::Result<ParallelWalkControl, E> + Sync,
 	H: Fn() -> std::result::Result<(), E> + Sync,
@@ -1424,7 +1810,25 @@ where
 	options.emit_root = true;
 	options.directory_errors = DirectoryErrorMode::Visit;
 	let mut visitor = SerialCandidateVisitor { filter: &request.filter, sink };
-	walk_entries(&request.root, options, &mut visitor, heartbeat)
+	walk_entries_with_stats(
+		&request.root,
+		options,
+		request.scan_limit,
+		&mut visitor,
+		heartbeat,
+	)
+	.map(|(status, traversal_stats)| {
+		(
+			status,
+			WalkStats {
+				cache_age_ms: 0,
+				scanned_entries: traversal_stats.scanned_entries,
+				filtered_entries: 0,
+				limited_entries: 0,
+				scan_limit_reached: traversal_stats.scan_limit_reached,
+			},
+		)
+	})
 }
 
 fn emit_parallel_root_file<E, S, H>(
@@ -1436,6 +1840,9 @@ fn emit_parallel_root_file<E, S, H>(
 	S: Fn(&FileCandidate) -> std::result::Result<ParallelWalkControl, E> + Sync,
 	H: Fn() -> std::result::Result<(), E> + Sync,
 {
+	if !shared.count_scanned_entry() {
+		return;
+	}
 	let meta = EntryMeta {
 		root:          &context.root,
 		absolute_path: Cow::Borrowed(context.root.as_path()),
@@ -1601,6 +2008,11 @@ fn walk_parallel_dir<'scope, E, S, H>(
 		push_relative_name(&mut relative, &name_str);
 		let is_dir = entry.file_type == FileType::Dir;
 		if !context.matcher.is_ignored(&dir_ignore, &absolute, is_dir) {
+			if !shared.count_scanned_entry() {
+				absolute.pop();
+				relative.truncate(relative_len);
+				break;
+			}
 			let decision = {
 				let meta = EntryMeta {
 					root:          &context.root,
@@ -1895,13 +2307,28 @@ fn metadata_for_follow_policy(path: &Path, follow: bool) -> io::Result<std::fs::
 	}
 }
 
+/// Statistics from the filesystem traversal before high-level filtering.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct WalkTraversalStats {
+	/// Entries encountered after existing ignore/hidden policies and before
+	/// high-level positive filtering.
+	pub scanned_entries:        usize,
+	/// Whether the optional scan budget stopped traversal.
+	pub scan_limit_reached:     bool,
+	/// Whether a high-level result limit stopped traversal after an additional
+	/// accepted entry was found.
+	pub result_limit_reached:   bool,
+}
+
 /// Owned entries returned by [`collect_entries`] plus cache metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CollectedEntries {
 	/// Entries collected with the requested traversal contract.
-	pub entries:      Vec<CollectedEntry>,
+	pub entries:             Vec<CollectedEntry>,
 	/// Age of the cache entry in milliseconds; zero means freshly scanned.
-	pub cache_age_ms: u64,
+	pub cache_age_ms:        u64,
+	/// Traversal statistics for this scan.
+	pub traversal_stats:     WalkTraversalStats,
 }
 
 /// Borrowed entry passed to [`EntryVisitor`].
@@ -2015,6 +2442,63 @@ pub trait EntryVisitor {
 		self.visit(entry)
 	}
 }
+struct FilteredCollectVisitor<'a> {
+	filter:  &'a WalkFilter,
+	limit:   Option<usize>,
+	emitted: usize,
+	entries: Vec<CollectedEntry>,
+}
+
+impl EntryVisitor for FilteredCollectVisitor<'_> {
+	type Error = String;
+
+	fn visit(&mut self, entry: Entry<'_>) -> std::result::Result<WalkControl, Self::Error> {
+		if self.limit.is_some_and(|limit| self.emitted >= limit) {
+			return Ok(WalkControl::Quit);
+		}
+		self.emitted += 1;
+		self.entries.push(CollectedEntry {
+			path: entry.relative.to_string(),
+			file_type: entry.file_type,
+			mtime: entry.mtime,
+			size: entry.size,
+		});
+		Ok(WalkControl::Continue)
+	}
+
+	fn decide_pre_descend(
+		&mut self,
+		meta: &EntryMeta<'_>,
+	) -> std::result::Result<PreDescendDecision, Self::Error> {
+		let is_dir = meta.file_type == FileType::Dir;
+		Ok(match self.filter.stream_decision(meta) {
+			WalkDecision::Include => PreDescendDecision {
+				emit: true,
+				descend: is_dir,
+				stop: false,
+			},
+			WalkDecision::Skip => PreDescendDecision {
+				emit: false,
+				descend: is_dir,
+				stop: false,
+			},
+			WalkDecision::SkipDescend => PreDescendDecision {
+				emit: false,
+				descend: false,
+				stop: false,
+			},
+			WalkDecision::Stop => PreDescendDecision { emit: false, descend: false, stop: true },
+		})
+	}
+
+	fn visit_pre_decided(
+		&mut self,
+		entry: Entry<'_>,
+	) -> std::result::Result<WalkControl, Self::Error> {
+		self.visit(entry)
+	}
+}
+
 struct RequestVisitor<'a, V, P> {
 	root:      &'a Path,
 	filter:    &'a WalkFilter,
@@ -2430,7 +2914,8 @@ where
 	H: FnMut() -> std::result::Result<(), E>,
 {
 	let mut collector = CollectVisitor::new();
-	let _status = walk_entries(root, options, &mut collector, heartbeat)?;
+	let (_status, traversal_stats) =
+		walk_entries_with_stats(root, options, None, &mut collector, heartbeat)?;
 	if options.contents_first {
 		sort_collected_depth_first(&mut collector.entries);
 	} else {
@@ -2438,7 +2923,11 @@ where
 			.entries
 			.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 	}
-	Ok(CollectedEntries { entries: collector.entries, cache_age_ms: 0 })
+	Ok(CollectedEntries {
+		entries: collector.entries,
+		cache_age_ms: 0,
+		traversal_stats,
+	})
 }
 
 /// Scans entries without cancellation using platform syscalls when supported.
@@ -2451,18 +2940,20 @@ pub fn collect_entries_without_heartbeat(
 
 /// Streams entries using the native scanner for every [`WalkOptions`]
 /// traversal contract.
-pub fn walk_entries<V, H>(
+/// Walk entries and return traversal statistics for an optional scan budget.
+pub fn walk_entries_with_stats<V, H>(
 	root: &Path,
 	options: WalkOptions,
+	scan_limit: Option<usize>,
 	visitor: &mut V,
 	heartbeat: H,
-) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+) -> std::result::Result<(WalkStatus, WalkTraversalStats), WalkError<V::Error>>
 where
 	V: EntryVisitor,
 	H: FnMut() -> std::result::Result<(), V::Error>,
 {
 	if options.min_depth > options.max_depth {
-		return Ok(WalkStatus::Complete);
+		return Ok((WalkStatus::Complete, WalkTraversalStats::default()));
 	}
 
 	let root_device = root_device_for_options(root, options);
@@ -2479,10 +2970,33 @@ where
 		relative_path: String::new(),
 		scratch_pool: Vec::new(),
 		visited: 0,
+		scanned_entries: 0,
+		scan_limit,
+		scan_limit_reached: false,
 		heartbeat,
 	};
 
-	context.walk_root(root, &root_ignore, visitor)
+	let status = context.walk_root(root, &root_ignore, visitor)?;
+	let stats = WalkTraversalStats {
+		scanned_entries: context.scanned_entries,
+		scan_limit_reached: context.scan_limit_reached,
+		result_limit_reached: false,
+	};
+	Ok((status, stats))
+}
+
+/// Walk entries without a scan budget.
+pub fn walk_entries<V, H>(
+	root: &Path,
+	options: WalkOptions,
+	visitor: &mut V,
+	heartbeat: H,
+) -> std::result::Result<WalkStatus, WalkError<V::Error>>
+where
+	V: EntryVisitor,
+	H: FnMut() -> std::result::Result<(), V::Error>,
+{
+	walk_entries_with_stats(root, options, None, visitor, heartbeat).map(|(status, _)| status)
 }
 
 struct WalkContext<'a, H> {
@@ -2493,9 +3007,12 @@ struct WalkContext<'a, H> {
 	matcher:           FastIgnore,
 	absolute_path:     PathBuf,
 	relative_path:     String,
-	scratch_pool:      Vec<DirScratch>,
-	visited:           usize,
-	heartbeat:         H,
+	scratch_pool:       Vec<DirScratch>,
+	visited:            usize,
+	scanned_entries:    usize,
+	scan_limit:         Option<usize>,
+	scan_limit_reached: bool,
+	heartbeat:          H,
 }
 
 impl<H> WalkContext<'_, H> {
@@ -2621,6 +3138,21 @@ impl<H> WalkContext<'_, H> {
 	fn pop_entry_path(&mut self, relative_len: usize) {
 		self.relative_path.truncate(relative_len);
 		self.absolute_path.pop();
+	}
+
+	fn count_scanned_entry(&mut self) -> bool {
+		if self
+			.scan_limit
+		.is_some_and(|scan_limit| self.scanned_entries >= scan_limit)
+		{
+			// Reaching the budget is not by itself partial: the current traversal
+			// may have just visited its final eligible entry. Mark it only when the
+			// next eligible entry is actually encountered.
+			self.scan_limit_reached = true;
+			return false;
+		}
+		self.scanned_entries += 1;
+		true
 	}
 
 	fn walk_dir<V>(
@@ -2887,6 +3419,10 @@ impl<H> WalkContext<'_, H> {
 			}
 		}
 
+		if !self.count_scanned_entry() {
+			return Ok(true);
+		}
+
 		let decision = {
 			let meta = EntryMeta {
 				root: self.root_path,
@@ -2924,7 +3460,11 @@ impl<H> WalkContext<'_, H> {
 			}
 		}
 
-		let child_stopped = if descend && next_depth < self.options.max_depth && decision.descend {
+		let child_stopped = if !self.scan_limit_reached
+			&& descend
+			&& next_depth < self.options.max_depth
+			&& decision.descend
+		{
 			self.walk_dir(next_depth, dir_ignore, true, visitor)?
 		} else {
 			false
@@ -2952,7 +3492,7 @@ impl<H> WalkContext<'_, H> {
 			}
 		}
 
-		Ok(false)
+		Ok(self.scan_limit_reached)
 	}
 }
 
@@ -3308,6 +3848,19 @@ fn push_relative_name(relative: &mut String, name: &str) {
 		relative.push('/');
 	}
 	relative.push_str(name);
+}
+
+fn normalize_request_relative_path(root: &Path, path: &Path) -> String {
+	let relative = path.strip_prefix(root).unwrap_or(path);
+	let mut normalized = relative.to_string_lossy().into_owned();
+	if cfg!(windows) {
+		normalized = normalized.replace('\\', "/");
+	}
+	if normalized == "." {
+		String::new()
+	} else {
+		normalized.strip_prefix("./").unwrap_or(&normalized).to_string()
+	}
 }
 
 fn mtime_millis(seconds: i64, nanos: i64) -> Option<f64> {
@@ -4621,6 +5174,150 @@ mod tests {
 			.expect("walk should not fail");
 		assert_eq!(status, WalkStatus::Complete);
 		visitor.seen
+	}
+
+	#[test]
+	fn compiled_excludes_report_invalid_patterns_and_prune_directories() {
+		let invalid = CompiledWalkExcludes::new(["[broken"])
+			.expect_err("invalid exclusion patterns should fail compilation");
+		assert!(invalid.to_string().contains("[broken"));
+
+		let tree = temp_tree("request-excludes");
+		fs::create_dir_all(tree.path().join("dataset/nested"))
+			.expect("excluded directory should be created");
+		fs::write(tree.path().join("dataset/nested/data.json"), "data")
+			.expect("excluded file should be written");
+		fs::write(tree.path().join("dataset/index.json"), "index")
+			.expect("explicit file should be written");
+		fs::write(tree.path().join("kept.json"), "kept")
+			.expect("kept file should be written");
+
+		let excludes = CompiledWalkExcludes::new(["dataset/**"]).expect("exclusion should compile");
+		let outcome = WalkRequest::from_options(tree.path(), test_options())
+			.filter(WalkFilter::files_only().exclude(excludes))
+			.explicit_file(tree.path().join("dataset/index.json"))
+			.collect()
+			.expect("excluded walk should collect successfully");
+		let paths = outcome
+			.entries
+			.iter()
+			.map(|entry| entry.path.as_str())
+			.collect::<Vec<_>>();
+
+		assert_eq!(paths, vec!["dataset/index.json", "kept.json"]);
+		assert_eq!(outcome.stats.scanned_entries, 4);
+		assert!(!outcome.stats.scan_limit_reached);
+	}
+
+	#[test]
+	fn request_limit_stops_filtered_collection_after_accepted_entries() {
+		let tree = temp_tree("request-filtered-limit");
+		fs::create_dir_all(tree.path().join("ignored/nested"))
+			.expect("excluded directory should be created");
+		for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+			fs::write(tree.path().join(name), name).expect("matching file should be written");
+		}
+		fs::write(tree.path().join("ignored/nested/drop.rs"), "drop")
+			.expect("excluded file should be written");
+
+		let outcome = WalkRequest::from_options(tree.path(), test_options())
+			.limit(2)
+			.filter(
+				WalkFilter::files_only()
+					.glob(CompiledWalkGlob::new(["*.rs"]).expect("positive glob should compile"))
+					.exclude(
+						CompiledWalkExcludes::new(["ignored/**"])
+							.expect("exclusion should compile"),
+					)
+			)
+			.collect()
+			.expect("filtered limited walk should collect successfully");
+		let paths = outcome
+			.entries
+			.iter()
+			.map(|entry| entry.path.as_str())
+			.collect::<Vec<_>>();
+
+		assert_eq!(paths, vec!["a.rs", "b.rs"]);
+		assert_eq!(outcome.stats.limited_entries, 1);
+		assert!(
+			outcome.stats.scanned_entries < 5,
+			"filtered collection should stop before scanning the whole tree: {:?}",
+			outcome.stats
+		);
+		assert!(!outcome.stats.scan_limit_reached);
+	}
+
+	#[test]
+	fn scan_limit_exact_boundary_is_complete() {
+		let tree = temp_tree("request-scan-limit-exact");
+		for name in ["a.txt", "b.txt"] {
+			fs::write(tree.path().join(name), name).expect("scan-boundary file should be written");
+		}
+
+		let outcome = WalkRequest::from_options(tree.path(), test_options())
+			.filter(WalkFilter::files_only())
+			.scan_limit(2)
+			.collect()
+			.expect("exact-boundary scan should complete cleanly");
+
+		assert_eq!(outcome.entries.len(), 2);
+		assert_eq!(outcome.stats.scanned_entries, 2);
+		assert!(!outcome.stats.scan_limit_reached);
+	}
+
+	#[test]
+	fn request_scan_limit_stops_before_positive_filter_can_scan_unbounded_tree() {
+		let tree = temp_tree("request-scan-limit");
+		for name in ["a.txt", "b.txt", "c.txt", "rare.rs"] {
+			fs::write(tree.path().join(name), name).expect("scan-budget fixture file should be written");
+		}
+
+		let outcome = WalkRequest::from_options(tree.path(), test_options())
+			.filter(
+				WalkFilter::files_only()
+					.glob(CompiledWalkGlob::new(["*.rs"]).expect("positive glob should compile")),
+			)
+			.scan_limit(2)
+			.collect()
+			.expect("scan budget should stop cleanly");
+
+		assert!(outcome.entries.is_empty(), "rare match should be beyond the scan budget");
+		assert_eq!(outcome.stats.scanned_entries, 2);
+		assert!(outcome.stats.scan_limit_reached);
+	}
+
+	#[test]
+	fn parallel_candidate_scan_limit_and_exclusion_match_serial_policy() {
+		let tree = temp_tree("parallel-scan-limit");
+		fs::create_dir_all(tree.path().join("excluded/nested"))
+			.expect("excluded directory should be created");
+		fs::write(tree.path().join("excluded/nested/no.txt"), "no")
+			.expect("excluded file should be written");
+		fs::write(tree.path().join("kept.txt"), "yes").expect("kept file should be written");
+
+		let request = WalkRequest::from_options(tree.path(), test_options())
+			.filter(
+				WalkFilter::files_only().exclude(
+					CompiledWalkExcludes::new(["excluded/**"])
+						.expect("exclusion should compile"),
+				),
+			)
+			.scan_limit(2);
+		let seen = std::sync::Mutex::new(Vec::new());
+		let (_status, stats) = request
+			.for_each_file_candidate_parallel_with_stats(
+				|candidate| {
+					seen.lock().expect("seen lock should not be poisoned").push(candidate.relative.clone());
+					Ok::<_, Infallible>(ParallelWalkControl::Continue)
+				},
+				|| Ok::<_, Infallible>(()),
+			)
+			.expect("parallel scan should stop cleanly");
+
+		assert_eq!(seen.into_inner().expect("seen lock should not be poisoned"), vec!["kept.txt"]);
+		assert_eq!(stats.scanned_entries, 2);
+		assert!(!stats.scan_limit_reached);
 	}
 
 	#[test]

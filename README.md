@@ -11,15 +11,19 @@ Both tools accept a single `path` string that can be:
 - a glob pattern
 - a semicolon- or whitespace-delimited path list like `src/**/*.ts;test/**/*.ts` or `src test`
 
+The wrappers process path-list roots in the order supplied and preserve deterministic first-seen output; `glob` de-duplicates paths returned by overlapping roots.
+
 Defaults are aimed at code search:
 
 - `gitignore: true`
 - `hidden: true` for `glob`
 - `case: true` for `grep`
+- `glob.limit: 50` (maximum 1,000)
+- `scanLimit: 50,000` total per tool call across all traversal roots (maximum 1,000,000)
 
 ### Important glob semantics
 
-This tool treats a leading glob as recursive:
+A plain directory path is searched recursively. Use `dir/*` to inspect only one level. This tool also treats a leading glob as recursive:
 
 - `*.ts` behaves like `**/*.ts`
 - `src/*.ts` stays non-recursive
@@ -66,7 +70,21 @@ Limit the number of returned paths:
 { "path": "*.ts", "limit": 50 }
 ```
 
-If `glob` hits the limit, the result is partial. Increase `limit` or narrow the path.
+Exclude a bulk directory relative to the traversal root:
+
+```json
+{ "path": ".", "exclude": ["dataset/**", "**/generated/**"] }
+```
+
+`exclude` is independent of `gitignore`; setting `gitignore: false` still applies explicit exclusions. Exclude patterns do not support negation. Direct file operands override exclusions, so `{ "path": "dataset/index.json", "exclude": ["dataset/**"] }` can still search that file. Invalid exclusion patterns report the offending pattern.
+
+A scan budget stops traversal after the configured number of encountered entries across the entire tool call (including all path-list roots):
+
+```json
+{ "path": ".", "scanLimit": 50000 }
+```
+
+If `glob` hits the result or scan limit, the result is partial. Increase `limit` or `scanLimit`, narrow the path, or add exclude patterns. `totalMatches` is a lower bound whenever a limit is reached.
 
 ### `grep`
 
@@ -100,6 +118,19 @@ Page through matching files:
 { "pattern": "needle", "path": "*.txt", "skip": 20 }
 ```
 
+Exclude generated content and bound traversal:
+
+```json
+{
+  "pattern": "needle",
+  "path": ".",
+  "exclude": ["dist/**", "**/generated/**"],
+  "scanLimit": 50000
+}
+```
+
+The same exclusion and direct-file override rules apply to `grep`. Exclude patterns do not support negation, and `exclude` remains active when `gitignore: false`. Its scan budget is also global across path-list roots. When `resultLimitReached` or `scanLimitReached` is true, `totalMatches` is a lower bound rather than an exact total.
+
 ### `grep limit`
 
 `grep.limit` means the maximum total matches collected across all searched files.
@@ -110,7 +141,9 @@ It does **not** mean:
 - lines shown
 - page size
 
-`grep` still pages matching files separately, so use `skip` to view later file groups.
+`grep` still pages matching files separately, so use `skip` to view later file groups. Each response renders at most 10 matching files and 10 matches per file. The final response is capped at 16 KiB or 300 lines, whichever comes first; collection limits remain separate so pagination does not silently reduce search recall.
+
+Result-limit responses include `[More matches omitted. Narrow path/glob or increase limit.]`. Scan-limit responses include `[Search stopped after scanning N entries. Results may be incomplete; narrow the path/glob or add exclude patterns.]`.
 
 ### `gitignore` behavior
 

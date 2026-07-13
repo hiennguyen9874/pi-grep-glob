@@ -17,19 +17,38 @@ import {
 } from "../utils/path-utils.js";
 
 const TIMEOUT_MS = 30_000;
-const FILE_PAGE_LIMIT = 20;
+const FILE_PAGE_LIMIT = 10;
+const RENDERED_MATCH_LIMIT = 10;
 const MULTI_FILE_MATCH_LIMIT = 20;
 const SINGLE_FILE_MATCH_LIMIT = 200;
 const NATIVE_MATCH_LIMIT = 2_000;
 const MAX_USER_LIMIT = 5_000;
+const DEFAULT_SCAN_LIMIT = 50_000;
+const MAX_SCAN_LIMIT = 1_000_000;
 const MAX_COLUMNS = 500;
 
 const grepSchema = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for." }),
-  path: Type.Optional(Type.String({ description: "File, directory, glob, or semicolon-/whitespace-delimited paths to search." })),
+  path: Type.Optional(
+    Type.String({
+      description: "File, directory (searched recursively), glob, or semicolon-/whitespace-delimited paths to search.",
+    }),
+  ),
   literal: Type.Optional(Type.Boolean({ description: "Treat pattern as a literal string instead of a regex." })),
   case: Type.Optional(Type.Boolean({ description: "Use case-sensitive matching. Defaults to true." })),
   gitignore: Type.Optional(Type.Boolean({ description: "Respect .gitignore files. Defaults to true." })),
+  exclude: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Glob patterns to exclude relative to each traversal root; no negation; explicit file operands override exclusions; independent of gitignore; patterns ending in /** prune directories.",
+    }),
+  ),
+  scanLimit: Type.Optional(
+    Type.Number({
+      description:
+        "Maximum total entries to scan across this tool call, clamped to 1..1000000. Results may be partial when the budget is reached. Defaults to 50000.",
+    }),
+  ),
   limit: Type.Optional(Type.Number({ description: "Maximum total matches to collect across all files, not files returned; clamped to 1..5000." })),
   skip: Type.Optional(Type.Number({ description: "Number of matching files to skip for pagination." })),
   contextBefore: Type.Optional(Type.Number({ description: "Lines of context before each match." })),
@@ -45,10 +64,15 @@ export interface GrepToolDetails {
   returnedFiles: number;
   skip: number;
   limit: number;
+  scanLimit: number;
+  scannedEntries: number;
+  resultLimitReached: boolean;
+  scanLimitReached: boolean;
   limitReached: boolean;
   nativeLimitReached: boolean;
   skippedOversized: number;
   maxMatchesPerFile: number;
+  maxRenderedMatchesPerFile: number;
   maxReturnedFiles: number;
   lineTruncated: boolean;
   truncation?: ReturnType<typeof formatGrepGroups>["truncation"];
@@ -62,9 +86,9 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
       "Search file contents by regex or literal text. Supports file, directory, glob, or semicolon-/whitespace-delimited paths. Results are grouped by file and paginated with skip.",
     promptSnippet: "grep: search file contents by regex or literal text",
     promptGuidelines: [
-      "Set literal=true when you want exact text, especially if the pattern includes regex characters like ., *, (, [, or ?.",
-      "Prefer the narrowest path you can; use a specific directory or glob before searching the whole workspace.",
-      "Use skip to page through more matching files; each response returns at most 20 files.",
+      "Use grep with literal=true for exact text containing regex characters.",
+      "Use grep on the narrowest available path or glob; for broad searches start with limit=50 and no context lines, then narrow before increasing either.",
+      "Use grep skip to page through additional matching files instead of requesting a large response.",
     ],
     parameters: grepSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -74,18 +98,24 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
         const skip = clampNonNegativeInteger(params.skip);
         const page = result.groups.slice(skip, skip + FILE_PAGE_LIMIT);
         const omittedFiles = Math.max(0, result.groups.length - skip - page.length);
-        const lineTruncated = page.some(([, matches]) => matches.some((match) => match.truncated));
-        const limitReached = omittedFiles > 0 || result.nativeLimitReached;
+        const renderedPage = page.map(
+          ([filePath, matches]) => [filePath, matches.slice(0, RENDERED_MATCH_LIMIT)] as [string, GrepMatch[]],
+        );
+        const renderedMatchesOmitted = page.some(([, matches]) => matches.length > RENDERED_MATCH_LIMIT);
+        const lineTruncated = renderedPage.some(([, matches]) => matches.some((match) => match.truncated));
+        const resultLimitReached = result.resultLimitReached;
+        const scanLimitReached = result.scanLimitReached;
+        const limitReached = resultLimitReached || scanLimitReached || omittedFiles > 0 || renderedMatchesOmitted;
         const formatted = formatGrepGroups(
-          page,
+          renderedPage,
           omittedFiles,
           buildGrepNotices({
-            limitReached,
+            resultLimitReached,
+            renderedMatchesOmitted,
+            scanLimitReached,
+            scanLimit: result.scanLimit,
             skippedOversized: result.skippedOversized,
-            maxMatchesPerFile: result.maxMatchesPerFile,
-            maxReturnedFiles: FILE_PAGE_LIMIT,
             lineTruncated,
-            limit: result.limit,
           }),
         );
 
@@ -98,10 +128,15 @@ export function createGrepTool(): ToolDefinition<typeof grepSchema, GrepToolDeta
             returnedFiles: page.length,
             skip,
             limit: result.limit,
+            scanLimit: result.scanLimit,
+            scannedEntries: result.scannedEntries,
+            resultLimitReached,
+            scanLimitReached,
             limitReached,
             nativeLimitReached: result.nativeLimitReached,
             skippedOversized: result.skippedOversized,
             maxMatchesPerFile: result.maxMatchesPerFile,
+            maxRenderedMatchesPerFile: RENDERED_MATCH_LIMIT,
             maxReturnedFiles: FILE_PAGE_LIMIT,
             lineTruncated,
             truncation: formatted.truncation,
@@ -122,11 +157,15 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
   let totalMatches = 0;
   let collectedMatches = 0;
   let nativeLimitReached = false;
+  let resultLimitReached = false;
+  let scanLimitReached = false;
+  let scannedEntries = 0;
   let skippedOversized = 0;
   let allEntriesMissing = true;
   const rawPaths = splitPathList(params.path, cwd);
   const singlePath = rawPaths.length === 1;
   const userLimit = clampPositiveInteger(params.limit, MAX_USER_LIMIT);
+  const scanLimit = clampScanLimit(params.scanLimit);
   const pattern = params.literal ? escapeRegex(params.pattern) : params.pattern;
   let effectiveLimit = userLimit ?? NATIVE_MATCH_LIMIT;
   let maxMatchesPerFile = MULTI_FILE_MATCH_LIMIT;
@@ -147,11 +186,15 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
 
     const remaining = maxCount - collectedMatches;
     if (remaining <= 0) {
-      nativeLimitReached = true;
+      resultLimitReached = true;
       break;
     }
-
     const isGlobPath = hasGlobMagic(rawPath);
+    const remainingScanLimit = scanLimit - scannedEntries;
+    if (remainingScanLimit <= 0 && !spec.explicitFile) {
+      scanLimitReached = true;
+      break;
+    }
     const result = await nativeGrep({
       pattern,
       path: spec.absoluteRoot,
@@ -159,6 +202,8 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
       ignoreCase: !(params.case ?? true),
       hidden: true,
       gitignore: params.gitignore ?? true,
+      exclude: params.exclude,
+      scanLimit: spec.explicitFile ? scanLimit : remainingScanLimit,
       maxCount: remaining,
       maxCountPerFile: perFileLimit,
       contextBefore: clampNonNegativeInteger(params.contextBefore),
@@ -171,7 +216,10 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
     filesSearched += result.filesSearched;
     totalMatches += result.totalMatches;
     collectedMatches += result.matches.length;
-    nativeLimitReached ||= Boolean(result.limitReached);
+    nativeLimitReached ||= result.resultLimitReached;
+    resultLimitReached ||= result.resultLimitReached;
+    scanLimitReached ||= result.scanLimitReached;
+    scannedEntries += result.scannedEntries;
     skippedOversized += result.skippedOversized ?? 0;
 
     for (const match of result.matches) {
@@ -179,6 +227,10 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
       const matches = grouped.get(displayPath) ?? [];
       matches.push({ ...match, path: displayPath });
       grouped.set(displayPath, matches);
+    }
+
+    if (result.resultLimitReached) {
+      break;
     }
   }
 
@@ -191,6 +243,10 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
     filesSearched,
     totalMatches,
     limit: effectiveLimit,
+    scannedEntries,
+    resultLimitReached,
+    scanLimitReached,
+    scanLimit,
     nativeLimitReached,
     skippedOversized,
     maxMatchesPerFile,
@@ -198,17 +254,20 @@ async function runGrep(params: GrepInput, cwd: string, signal: AbortSignal | und
 }
 
 function buildGrepNotices(options: {
-  limitReached: boolean;
+  resultLimitReached: boolean;
+  renderedMatchesOmitted: boolean;
+  scanLimitReached: boolean;
+  scanLimit: number;
   skippedOversized: number;
-  maxMatchesPerFile: number;
-  maxReturnedFiles: number;
   lineTruncated: boolean;
-  limit: number;
 }): string[] {
   const notices: string[] = [];
-  if (options.limitReached) {
+  if (options.resultLimitReached || options.renderedMatchesOmitted) {
+    notices.push("More matches omitted. Narrow path/glob or increase limit.");
+  }
+  if (options.scanLimitReached) {
     notices.push(
-      `Results limited: max ${options.limit} matches collected, showing ${options.maxReturnedFiles} files/page, ${options.maxMatchesPerFile} matches/file. Use skip or narrow path/glob.`,
+      `Search stopped after scanning ${options.scanLimit} entries. Results may be incomplete; narrow the path/glob or add exclude patterns.`,
     );
   }
   if (options.skippedOversized > 0) {
@@ -239,6 +298,13 @@ function clampPositiveInteger(value: number | undefined, max: number): number | 
     return undefined;
   }
   return Math.min(max, Math.max(1, Math.trunc(value)));
+}
+
+function clampScanLimit(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_SCAN_LIMIT;
+  }
+  return Math.min(MAX_SCAN_LIMIT, Math.max(1, Math.trunc(value)));
 }
 
 function validatePattern(pattern: string): void {

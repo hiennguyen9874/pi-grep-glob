@@ -33,6 +33,10 @@ pub struct GlobOptions<'env> {
 	pub pattern:              String,
 	/// Directory to search.
 	pub path:                 String,
+	/// Exclusion globs relative to the search root.
+	pub exclude:              Option<Vec<String>>,
+	/// Maximum number of entries to scan before stopping.
+	pub scan_limit:           Option<u32>,
 	/// Filter by file type: "file", "dir", or "symlink". Symlinks are
 	/// matched for file/dir filters based on their target type.
 	pub file_type:            Option<FileType>,
@@ -61,15 +65,26 @@ pub struct GlobOptions<'env> {
 #[napi(object)]
 pub struct GlobResult {
 	/// Matched filesystem entries.
-	pub matches:       Vec<GlobMatch>,
-	/// Number of returned matches (`matches.len()`), clamped to `u32::MAX`.
-	pub total_matches: u32,
+	pub matches:              Vec<GlobMatch>,
+	/// Number of returned matches (`matches.len()`), clamped to `u32::MAX`; it
+	/// is a lower bound when a limit stops traversal.
+	pub total_matches:        u32,
+	/// Number of entries encountered before positive filtering.
+	pub scanned_entries:      u32,
+	/// Whether the result limit omitted an accepted match.
+	pub result_limit_reached: bool,
+	/// Whether the scan budget stopped traversal.
+	pub scan_limit_reached:   bool,
+	/// Whether either result or scan limit stopped the operation.
+	pub limit_reached:        bool,
 }
 
 /// Internal runtime config for a single glob execution.
 struct GlobConfig {
 	root:                  std::path::PathBuf,
 	pattern:               String,
+	exclude:               Option<Vec<String>>,
+	scan_limit:            Option<usize>,
 	recursive:             bool,
 	include_hidden:        bool,
 	file_type_filter:      Option<FileType>,
@@ -129,7 +144,7 @@ fn collect_ranked_matches(
 	request: &pi_walker::WalkRequest,
 	config: &GlobConfig,
 	ct: &task::CancelToken,
-) -> Result<Vec<GlobMatch>> {
+) -> Result<(Vec<GlobMatch>, pi_walker::WalkStats)> {
 	let outcome = request
 		.collect_ranked_with_heartbeat(
 			pi_walker::WalkRank::MtimeDescPathAsc,
@@ -137,17 +152,21 @@ fn collect_ranked_matches(
 			|| ct.heartbeat(),
 		)
 		.map_err(iofs::map_walker_error)?;
-	Ok(outcome.entries.into_iter().map(GlobMatch::from).collect())
+	Ok((
+		outcome.entries.into_iter().map(GlobMatch::from).collect(),
+		outcome.stats,
+	))
 }
 
 fn collect_native_filtered_matches(
 	request: &pi_walker::WalkRequest,
 	config: &GlobConfig,
 	ct: &task::CancelToken,
-) -> Result<Vec<GlobMatch>> {
+) -> Result<(Vec<GlobMatch>, pi_walker::WalkStats)> {
 	let outcome = request
 		.collect_with_heartbeat(|| ct.heartbeat())
 		.map_err(iofs::map_walker_error)?;
+	let stats = outcome.stats;
 	let mut collected = Vec::new();
 	for entry in outcome.entries {
 		ct.heartbeat()?;
@@ -157,11 +176,11 @@ fn collect_native_filtered_matches(
 		};
 		matched_entry.file_type = effective_file_type;
 		collected.push(matched_entry);
-		if !config.sort_by_mtime && collected.len() >= config.max_results {
+		if !config.sort_by_mtime && collected.len() > config.max_results {
 			break;
 		}
 	}
-	Ok(collected)
+	Ok((collected, stats))
 }
 
 /// Executes walker-owned glob filtering plus optional native file-type
@@ -174,8 +193,24 @@ fn run_glob(
 	let walk_glob_pattern = glob_util::build_glob_pattern(&config.pattern, config.recursive);
 	let walk_glob = pi_walker::CompiledWalkGlob::new([walk_glob_pattern])
 		.map_err(|err| Error::from_reason(format!("Invalid glob pattern: {err}")))?;
+	let excludes = config
+		.exclude
+		.as_deref()
+		.filter(|patterns| !patterns.is_empty())
+		.map(|patterns| {
+			pi_walker::CompiledWalkExcludes::new(patterns.iter().cloned())
+				.map_err(|err| Error::from_reason(format!("Invalid exclude pattern: {err}")))
+		})
+		.transpose()?;
 	if config.max_results == 0 {
-		return Ok(GlobResult { matches: Vec::new(), total_matches: 0 });
+		return Ok(GlobResult {
+			matches: Vec::new(),
+			total_matches: 0,
+			scanned_entries: 0,
+			result_limit_reached: false,
+			scan_limit_reached: false,
+			limit_reached: false,
+		});
 	}
 
 	let scan_detail = if config.sort_by_mtime {
@@ -183,7 +218,13 @@ fn run_glob(
 	} else {
 		pi_walker::WalkDetail::Minimal
 	};
-	let base_request = pi_walker::WalkRequest::new(config.root.clone())
+	let mut filter = pi_walker::WalkFilter::all()
+		.glob(walk_glob)
+		.node_modules_unless_mentioned(config.mentions_node_modules);
+	if let Some(excludes) = excludes {
+		filter = filter.exclude(excludes);
+	}
+	let mut base_request = pi_walker::WalkRequest::new(config.root.clone())
 		.hidden(config.include_hidden)
 		.gitignore(config.use_gitignore)
 		.skip_git(true)
@@ -196,42 +237,49 @@ fn run_glob(
 		.directory_errors(pi_walker::DirectoryErrorMode::SkipSkippable)
 		.cache(config.cache)
 		.empty_recheck(pi_walker::EmptyRecheck::Configured)
-		.filter(
-			pi_walker::WalkFilter::all()
-				.glob(walk_glob)
-				.node_modules_unless_mentioned(config.mentions_node_modules),
-		);
+		.filter(filter);
+	if let Some(scan_limit) = config.scan_limit {
+		base_request = base_request.scan_limit(scan_limit);
+	}
 
-	let mut matches = if config.sort_by_mtime && config.file_type_filter.is_none() {
-		collect_ranked_matches(&base_request, &config, &ct)?
-	} else {
-		let request = if !config.sort_by_mtime && config.file_type_filter.is_none() {
-			base_request.limit(config.max_results)
+	let (mut matches, stats, mut result_limit_reached) =
+		if config.sort_by_mtime && config.file_type_filter.is_none() {
+			let (matches, stats) = collect_ranked_matches(&base_request, &config, &ct)?;
+			(matches, stats, stats.limited_entries > 0)
 		} else {
-			base_request
+			let request = if !config.sort_by_mtime && config.file_type_filter.is_none() {
+				base_request.limit(config.max_results.saturating_add(1))
+			} else {
+				base_request
+			};
+			let (matches, stats) = collect_native_filtered_matches(&request, &config, &ct)?;
+			let result_limit_reached = matches.len() > config.max_results || stats.limited_entries > 0;
+			(matches, stats, result_limit_reached)
 		};
-		collect_native_filtered_matches(&request, &config, &ct)?
-	};
 
 	if config.sort_by_mtime {
 		// Sorting mode: rank by mtime descending, then apply max-results truncation.
 		matches.sort_by(compare_matches_by_rank);
-		matches.truncate(config.max_results);
-		if let Some(callback) = on_match {
-			for matched_entry in &matches {
-				callback.call(Ok(matched_entry.clone()), ThreadsafeFunctionCallMode::NonBlocking);
-			}
+		if matches.len() > config.max_results {
+			result_limit_reached = true;
 		}
 	}
-	if !config.sort_by_mtime
-		&& let Some(callback) = on_match
-	{
+	matches.truncate(config.max_results);
+	if let Some(callback) = on_match {
 		for matched_entry in &matches {
 			callback.call(Ok(matched_entry.clone()), ThreadsafeFunctionCallMode::NonBlocking);
 		}
 	}
+	let scan_limit_reached = stats.scan_limit_reached;
 	let total_matches = matches.len().min(u32::MAX as usize) as u32;
-	Ok(GlobResult { matches, total_matches })
+	Ok(GlobResult {
+		matches,
+		total_matches,
+		scanned_entries: stats.scanned_entries.min(u32::MAX as usize) as u32,
+		result_limit_reached,
+		scan_limit_reached,
+		limit_reached: result_limit_reached || scan_limit_reached,
+	})
 }
 
 /// Find filesystem entries matching a glob pattern.
@@ -256,6 +304,8 @@ pub fn glob(
 	let GlobOptions {
 		pattern,
 		path,
+		exclude,
+		scan_limit,
 		file_type,
 		recursive,
 		hidden,
@@ -279,6 +329,8 @@ pub fn glob(
 			GlobConfig {
 				root: pi_walker::resolve_search_path(&path).map_err(iofs::map_walker_error)?,
 				include_hidden: hidden.unwrap_or(false),
+				exclude,
+				scan_limit: scan_limit.map(|value| value as usize),
 				file_type_filter: file_type,
 				recursive: recursive.unwrap_or(true),
 				max_results: max_results.map_or(usize::MAX, |value| value as usize),
@@ -340,6 +392,68 @@ mod tests {
 	}
 
 	#[test]
+	fn run_glob_with_exclude_prunes_directory_and_reports_result_limit() {
+		let root = TempDirGuard::new();
+		fs::create_dir_all(root.path().join("dataset/nested")).expect("create excluded directory");
+		fs::write(root.path().join("dataset/nested/drop.rs"), "drop").expect("write excluded file");
+		for name in ["a.rs", "b.rs", "c.rs"] {
+			fs::write(root.path().join(name), name).expect("write matching file");
+		}
+
+		let result = super::run_glob(
+			super::GlobConfig {
+				root:                  root.path().to_path_buf(),
+				pattern:               "*.rs".to_string(),
+				exclude:               Some(vec!["dataset/**".to_string()]),
+				scan_limit:            None,
+				recursive:             true,
+				include_hidden:        false,
+				file_type_filter:      Some(super::FileType::File),
+				max_results:           2,
+				use_gitignore:         false,
+				mentions_node_modules: false,
+				sort_by_mtime:         false,
+				cache:                 false,
+			},
+			None,
+			crate::task::CancelToken::default(),
+		)
+		.expect("glob succeeds");
+
+		assert_eq!(match_paths(&result), ["a.rs", "b.rs"]);
+		assert!(result.result_limit_reached);
+		assert!(!result.scan_limit_reached);
+		assert!(result.scanned_entries >= 4, "excluded directory should be encountered");
+	}
+
+	#[test]
+	fn run_glob_reports_offending_exclude_pattern() {
+		let root = TempDirGuard::new();
+		let result = super::run_glob(
+			super::GlobConfig {
+				root:                  root.path().to_path_buf(),
+				pattern:               "*".to_string(),
+				exclude:               Some(vec!["[broken".to_string()]),
+				scan_limit:            None,
+				recursive:             true,
+				include_hidden:        false,
+				file_type_filter:      None,
+				max_results:           1,
+				use_gitignore:         false,
+				mentions_node_modules: false,
+				sort_by_mtime:         false,
+				cache:                 false,
+			},
+			None,
+			crate::task::CancelToken::default(),
+		);
+		let Err(error) = result else {
+			panic!("invalid exclusion should fail");
+		};
+		assert!(error.to_string().contains("[broken"));
+	}
+
+	#[test]
 	fn run_glob_with_gitignore_prunes_ignored_directory_but_keeps_matching_sibling() {
 		let root = TempDirGuard::new();
 		fs::create_dir_all(root.path().join(".git")).expect("create repo marker");
@@ -353,6 +467,8 @@ mod tests {
 			super::GlobConfig {
 				root:                  root.path().to_path_buf(),
 				pattern:               "*.rs".to_string(),
+				exclude:               None,
+				scan_limit:            None,
 				recursive:             true,
 				include_hidden:        false,
 				file_type_filter:      Some(super::FileType::File),

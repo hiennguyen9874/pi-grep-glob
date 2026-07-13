@@ -5,6 +5,8 @@ export type FileTypeValue = 1 | 2 | 3;
 export interface GlobOptions {
   pattern: string;
   path: string;
+  exclude?: string[];
+  scanLimit?: number;
   fileType?: FileTypeValue;
   recursive?: boolean;
   hidden?: boolean;
@@ -27,6 +29,10 @@ export interface GlobMatch {
 export interface GlobResult {
   matches: GlobMatch[];
   totalMatches: number;
+  scannedEntries: number;
+  resultLimitReached: boolean;
+  scanLimitReached: boolean;
+  limitReached: boolean;
 }
 
 export type GrepOutputModeValue = "content" | "count" | "filesWithMatches";
@@ -50,6 +56,8 @@ export interface GrepOptions extends SearchOptions {
   type?: string;
   hidden?: boolean;
   gitignore?: boolean;
+  exclude?: string[];
+  scanLimit?: number;
   maxCountPerFile?: number;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -86,6 +94,9 @@ export interface GrepResult {
   filesWithMatches: number;
   filesSearched: number;
   limitReached?: boolean;
+  resultLimitReached: boolean;
+  scannedEntries: number;
+  scanLimitReached: boolean;
   skippedOversized?: number;
 }
 

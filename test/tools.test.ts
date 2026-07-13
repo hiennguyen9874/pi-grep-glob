@@ -33,6 +33,17 @@ function textOf(result: Awaited<ReturnType<ToolDefinition["execute"]>>): string 
 }
 
 describe("glob tool", () => {
+  it("publishes recursive-path guidance", () => {
+    const tool = createGlobTool();
+
+    expect(tool.promptGuidelines).toEqual([
+      "Use glob with limit=50 or less when exploring a broad or unfamiliar path. A plain directory path is recursive; use dir/* to inspect one level and narrow the glob before increasing the limit.",
+      "Do not use glob to enumerate dataset, generated, dependency, build, or cache trees unless the task requires them; use grep directly with a narrow path/glob for content search.",
+      "Keep glob gitignore=true unless ignored files are explicitly required.",
+    ]);
+    expect((tool.parameters.properties.path as any).description).toContain("searched recursively");
+  });
+
   it("finds src/**/*.ts", async () => {
     await withFixture(async (fixture) => {
       await mkdir(join(fixture, "src", "nested"), { recursive: true });
@@ -119,19 +130,164 @@ describe("glob tool", () => {
 
   it("enforces and clamps limit", async () => {
     await withFixture(async (fixture) => {
-      for (let index = 0; index < 5; index += 1) {
+      for (let index = 0; index < 55; index += 1) {
         await writeFile(join(fixture, `file-${index}.ts`), "file\n");
       }
 
       const limited = await executeTool(createGlobTool(), { path: "*.ts", limit: 2, gitignore: false }, fixture);
       expect(textOf(limited).split("\n").filter((line) => line && !line.startsWith("[")).length).toBe(2);
-      expect(textOf(limited)).toContain("[More matches omitted. Increase limit or narrow path.]");
+      expect(textOf(limited)).toContain("[More matches omitted. Narrow path/glob or increase limit.]");
       expect(limited.details?.limit).toBe(2);
       expect(limited.details?.returnedMatches).toBe(2);
       expect(limited.details?.limitReached).toBe(true);
+      expect(limited.details?.resultLimitReached).toBe(true);
+      expect(limited.details?.scanLimitReached).toBe(false);
+
+      const defaulted = await executeTool(createGlobTool(), { path: "*.ts", gitignore: false }, fixture);
+      expect(defaulted.details?.limit).toBe(50);
+      expect(defaulted.details?.returnedMatches).toBe(50);
+      expect(textOf(defaulted)).toContain("[More matches omitted. Narrow path/glob or increase limit.]");
 
       const clamped = await executeTool(createGlobTool(), { path: "*.ts", limit: 5000, gitignore: false }, fixture);
       expect(clamped.details?.limit).toBe(1000);
+    });
+  });
+
+  it("continues past duplicate glob roots before applying the global limit", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "one"));
+      await mkdir(join(fixture, "two"));
+      for (const name of ["a.ts", "b.ts", "c.ts"]) {
+        await writeFile(join(fixture, "one", name), name);
+      }
+      await writeFile(join(fixture, "two", "d.ts"), "d.ts\n");
+
+      const result = await executeTool(
+        createGlobTool(),
+        { path: "one one two", limit: 4, gitignore: false },
+        fixture,
+      );
+
+      expect(textOf(result).split("\n").sort()).toEqual(["one/a.ts", "one/b.ts", "one/c.ts", "two/d.ts"]);
+      expect(result.details?.resultLimitReached).toBe(false);
+    });
+  });
+
+  it("applies root-relative and nested excludes before traversal", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "dataset", "nested"), { recursive: true });
+      await mkdir(join(fixture, "src", "generated"), { recursive: true });
+      await writeFile(join(fixture, "dataset", "nested", "drop.ts"), "drop\n");
+      await writeFile(join(fixture, "src", "generated", "drop.ts"), "drop\n");
+      await writeFile(join(fixture, "keep.ts"), "keep\n");
+
+      const result = await executeTool(
+        createGlobTool(),
+        { path: ".", exclude: ["dataset/**", "**/generated/**"], gitignore: false },
+        fixture,
+      );
+
+      expect(textOf(result)).toContain("keep.ts");
+      expect(textOf(result)).not.toContain("dataset");
+      expect(textOf(result)).not.toContain("generated");
+      expect(result.details?.scanLimit).toBe(50_000);
+    });
+  });
+
+  it("applies excludes relative to every path-list root", async () => {
+    await withFixture(async (fixture) => {
+      for (const root of ["one", "two"]) {
+        await mkdir(join(fixture, root, "nested"), { recursive: true });
+        await writeFile(join(fixture, root, "keep.ts"), "keep\n");
+        await writeFile(join(fixture, root, "nested", "drop.ts"), "drop\n");
+      }
+
+      const result = await executeTool(
+        createGlobTool(),
+        { path: "one two", exclude: ["nested/**"], gitignore: false },
+        fixture,
+      );
+
+      expect(textOf(result).split("\n").sort()).toEqual(["one/keep.ts", "two/keep.ts"]);
+    });
+  });
+
+  it("prunes excluded directories and keeps gitignore independent", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "dataset", "nested"), { recursive: true });
+      await writeFile(join(fixture, "dataset", "nested", "drop.ts"), "drop\n");
+      await writeFile(join(fixture, "keep.ts"), "keep\n");
+      await writeFile(join(fixture, "ignored.ts"), "ignored\n");
+      await writeFile(join(fixture, ".gitignore"), "ignored.ts\n");
+
+      const baseline = await executeTool(createGlobTool(), { path: ".", gitignore: false }, fixture);
+      const excluded = await executeTool(
+        createGlobTool(),
+        { path: ".", exclude: ["dataset/**"], gitignore: false },
+        fixture,
+      );
+
+      expect(excluded.details?.scannedEntries).toBeLessThan(baseline.details?.scannedEntries ?? 0);
+      expect(textOf(excluded)).toContain("keep.ts");
+      expect(textOf(excluded)).not.toContain("dataset");
+      expect(textOf(excluded)).toContain("ignored.ts");
+
+      const ignored = await executeTool(
+        createGlobTool(),
+        { path: ".", exclude: ["dataset/**"], gitignore: true },
+        fixture,
+      );
+      expect(textOf(ignored)).not.toContain("ignored.ts");
+    });
+  });
+
+  it("allows explicit file operands to override excludes and reports invalid patterns", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "dataset"));
+      await writeFile(join(fixture, "dataset", "index.json"), "index\n");
+
+      const explicit = await executeTool(
+        createGlobTool(),
+        { path: "dataset/index.json", exclude: ["dataset/**"], gitignore: false },
+        fixture,
+      );
+      expect(textOf(explicit)).toBe("dataset/index.json");
+      expect(explicit.details?.scannedEntries).toBe(0);
+
+      await expect(
+        executeTool(
+          createGlobTool(),
+          { path: "dataset/index.json", exclude: ["[broken"], gitignore: false },
+          fixture,
+        ),
+      ).rejects.toThrow(/\[broken/);
+    });
+  });
+
+  it("uses one scan budget across path-list roots", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "one"));
+      await mkdir(join(fixture, "two"));
+      await writeFile(join(fixture, "one", "one.ts"), "one\n");
+      await writeFile(join(fixture, "two", "two.ts"), "two\n");
+
+      const result = await executeTool(
+        createGlobTool(),
+        { path: "one two", scanLimit: 1, gitignore: false },
+        fixture,
+      );
+
+      expect(result.details?.scanLimit).toBe(1);
+      expect(result.details?.scannedEntries).toBe(1);
+      expect(result.details?.scanLimitReached).toBe(true);
+      expect(result.details?.resultLimitReached).toBe(false);
+      expect(result.details?.limitReached).toBe(true);
+      expect(textOf(result)).toContain(
+        "[Search stopped after scanning 1 entries. Results may be incomplete; narrow the path/glob or add exclude patterns.]",
+      );
+
+      const clamped = await executeTool(createGlobTool(), { path: "one", scanLimit: 5_000_000 }, fixture);
+      expect(clamped.details?.scanLimit).toBe(1_000_000);
     });
   });
 
@@ -215,8 +371,10 @@ describe("grep tool", () => {
       expect(result.details?.limit).toBe(2);
       expect(result.details?.limitReached).toBe(true);
       expect(result.details?.nativeLimitReached).toBe(true);
+      expect(result.details?.resultLimitReached).toBe(true);
+      expect(result.details?.scanLimitReached).toBe(false);
       expect(result.details?.maxMatchesPerFile).toBe(2);
-      expect(textOf(result)).toContain("[Results limited: max 2 matches collected");
+      expect(textOf(result)).toContain("[More matches omitted. Narrow path/glob or increase limit.]");
     });
   });
 
@@ -233,6 +391,115 @@ describe("grep tool", () => {
       const ignored = await executeTool(createGrepTool(), { pattern: "needle", path: "*.txt", gitignore: false }, fixture);
       expect(textOf(ignored)).toContain("visible.txt");
       expect(textOf(ignored)).toContain("ignored.txt");
+    });
+  });
+
+  it("applies root-relative and nested excludes without counting excluded files", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "dataset", "nested"), { recursive: true });
+      await mkdir(join(fixture, "src", "generated"), { recursive: true });
+      await writeFile(join(fixture, "dataset", "nested", "drop.txt"), "needle\n");
+      await writeFile(join(fixture, "src", "generated", "drop.txt"), "needle\n");
+      await writeFile(join(fixture, "keep.txt"), "needle\n");
+
+      const baseline = await executeTool(createGrepTool(), { pattern: "needle", path: ".", gitignore: false }, fixture);
+      const excluded = await executeTool(
+        createGrepTool(),
+        { pattern: "needle", path: ".", exclude: ["dataset/**", "**/generated/**"], gitignore: false },
+        fixture,
+      );
+
+      expect(textOf(excluded)).toContain("keep.txt");
+      expect(textOf(excluded)).not.toContain("dataset");
+      expect(textOf(excluded)).not.toContain("generated");
+      expect(excluded.details?.filesSearched).toBe(1);
+      expect(excluded.details?.scannedEntries).toBeLessThan(baseline.details?.scannedEntries ?? 0);
+    });
+  });
+
+  it("applies excludes relative to every path-list root", async () => {
+    await withFixture(async (fixture) => {
+      for (const root of ["one", "two"]) {
+        await mkdir(join(fixture, root, "nested"), { recursive: true });
+        await writeFile(join(fixture, root, "keep.txt"), "needle\n");
+        await writeFile(join(fixture, root, "nested", "drop.txt"), "needle\n");
+      }
+
+      const result = await executeTool(
+        createGrepTool(),
+        { pattern: "needle", path: "one two", exclude: ["nested/**"], gitignore: false },
+        fixture,
+      );
+
+      expect(textOf(result)).toContain("one/keep.txt");
+      expect(textOf(result)).toContain("two/keep.txt");
+      expect(textOf(result)).not.toContain("nested/drop.txt");
+    });
+  });
+
+  it("keeps explicit excludes active when gitignore is disabled", async () => {
+    await withFixture(async (fixture) => {
+      await writeFile(join(fixture, ".gitignore"), "ignored.txt\n");
+      await writeFile(join(fixture, "ignored.txt"), "needle\n");
+      await writeFile(join(fixture, "excluded.txt"), "needle\n");
+      await writeFile(join(fixture, "kept.txt"), "needle\n");
+
+      const result = await executeTool(
+        createGrepTool(),
+        { pattern: "needle", path: "*.txt", exclude: ["excluded.txt"], gitignore: false },
+        fixture,
+      );
+
+      expect(textOf(result)).toContain("ignored.txt");
+      expect(textOf(result)).not.toContain("excluded.txt");
+      expect(textOf(result)).toContain("kept.txt");
+    });
+  });
+
+  it("allows explicit file operands to override excludes and reports invalid patterns", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "dataset"));
+      await writeFile(join(fixture, "dataset", "index.txt"), "needle\n");
+
+      const explicit = await executeTool(
+        createGrepTool(),
+        { pattern: "needle", path: "dataset/index.txt", exclude: ["dataset/**"], gitignore: false },
+        fixture,
+      );
+      expect(textOf(explicit)).toContain("dataset/index.txt");
+      expect(explicit.details?.scannedEntries).toBe(0);
+
+      await expect(
+        executeTool(createGrepTool(), { pattern: "needle", path: ".", exclude: ["[broken"], gitignore: false }, fixture),
+      ).rejects.toThrow(/\[broken/);
+    });
+  });
+
+  it("uses one scan budget across path-list roots", async () => {
+    await withFixture(async (fixture) => {
+      await mkdir(join(fixture, "one"));
+      await mkdir(join(fixture, "two"));
+      await writeFile(join(fixture, "one", "one.txt"), "needle\n");
+      await writeFile(join(fixture, "two", "two.txt"), "needle\n");
+
+      const result = await executeTool(
+        createGrepTool(),
+        { pattern: "needle", path: "one two", scanLimit: 1, gitignore: false },
+        fixture,
+      );
+
+      expect(result.details?.scanLimit).toBe(1);
+      expect(result.details?.scannedEntries).toBe(1);
+      expect(result.details?.scanLimitReached).toBe(true);
+      expect(result.details?.resultLimitReached).toBe(false);
+      expect(result.details?.nativeLimitReached).toBe(false);
+      expect(result.details?.limitReached).toBe(true);
+      expect(textOf(result)).toContain(
+        "[Search stopped after scanning 1 entries. Results may be incomplete; narrow the path/glob or add exclude patterns.]",
+      );
+
+      const clamped = await executeTool(createGrepTool(), { pattern: "needle", path: "one", scanLimit: 5_000_000 }, fixture);
+      expect(clamped.details?.scanLimit).toBe(1_000_000);
     });
   });
 
@@ -272,8 +539,13 @@ describe("grep tool", () => {
 
       const firstPage = await executeTool(createGrepTool(), { pattern: "needle", path: "*.txt" }, fixture);
       expect(firstPage.details?.filesWithMatches).toBe(25);
-      expect(firstPage.details?.returnedFiles).toBe(20);
-      expect(textOf(firstPage)).toContain("[5 more files with matches omitted. Use skip to view more.]");
+      expect(firstPage.details?.returnedFiles).toBe(10);
+      expect(textOf(firstPage)).toContain("[15 more files with matches omitted. Use skip to view more.]");
+
+      const middlePage = await executeTool(createGrepTool(), { pattern: "needle", path: "*.txt", skip: 10 }, fixture);
+      expect(middlePage.details?.filesWithMatches).toBe(25);
+      expect(middlePage.details?.returnedFiles).toBe(10);
+      expect(textOf(middlePage)).toContain("[5 more files with matches omitted. Use skip to view more.]");
 
       const secondPage = await executeTool(createGrepTool(), { pattern: "needle", path: "*.txt", skip: 20 }, fixture);
       expect(secondPage.details?.filesWithMatches).toBe(25);
@@ -296,6 +568,20 @@ describe("grep tool", () => {
     });
   });
 
+  it("renders at most ten matches per file without reducing native collection", async () => {
+    await withFixture(async (fixture) => {
+      await writeFile(join(fixture, "a.txt"), "needle\n".repeat(15));
+
+      const result = await executeTool(createGrepTool(), { pattern: "needle", path: "a.txt", gitignore: false }, fixture);
+      const renderedMatches = textOf(result).split("\n").filter((line) => line.startsWith("*"));
+
+      expect(result.details?.totalMatches).toBe(15);
+      expect(result.details?.maxRenderedMatchesPerFile).toBe(10);
+      expect(renderedMatches).toHaveLength(10);
+      expect(textOf(result)).toContain("[More matches omitted. Narrow path/glob or increase limit.]");
+    });
+  });
+
   it("truncates long output", async () => {
     await withFixture(async (fixture) => {
       const longNeedleLine = `${"x".repeat(600)} needle\n`;
@@ -305,8 +591,13 @@ describe("grep tool", () => {
 
       const result = await executeTool(createGrepTool(), { pattern: "needle", path: "*.txt", gitignore: false }, fixture);
 
+      const text = textOf(result);
       expect(result.details?.truncation?.truncated).toBe(true);
-      expect(textOf(result)).toContain("[Output truncated:");
+      expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(16 * 1024);
+      expect(text.split("\n").length).toBeLessThanOrEqual(300);
+      expect(text).toContain("[10 more files with matches omitted. Use skip to view more.]");
+      expect(text).toContain("[More matches omitted. Narrow path/glob or increase limit.]");
+      expect(text).toContain("[Output truncated:");
     });
   });
 });

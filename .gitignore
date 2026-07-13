@@ -183,3 +183,4 @@ examples
 # Native build output
 native/target/
 native/index.node
+native/crates/pi-walker/target

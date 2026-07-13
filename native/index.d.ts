@@ -53,6 +53,10 @@ export interface GlobOptions {
   pattern: string
   /** Directory to search. */
   path: string
+  /** Exclusion globs relative to the search root. */
+  exclude?: Array<string>
+  /** Maximum number of entries to scan before stopping. */
+  scanLimit?: number
   /**
    * Filter by file type: "file", "dir", or "symlink". Symlinks are
    * matched for file/dir filters based on their target type.
@@ -85,8 +89,19 @@ export interface GlobOptions {
 export interface GlobResult {
   /** Matched filesystem entries. */
   matches: Array<GlobMatch>
-  /** Number of returned matches (`matches.len()`), clamped to `u32::MAX`. */
+  /**
+   * Number of returned matches (`matches.len()`), clamped to `u32::MAX`; it
+   * is a lower bound when a limit stops traversal.
+   */
   totalMatches: number
+  /** Number of entries encountered before positive filtering. */
+  scannedEntries: number
+  /** Whether the result limit omitted an accepted match. */
+  resultLimitReached: boolean
+  /** Whether the scan budget stopped traversal. */
+  scanLimitReached: boolean
+  /** Whether either result or scan limit stopped the operation. */
+  limitReached: boolean
 }
 
 /**
@@ -137,6 +152,10 @@ export interface GrepOptions {
   hidden?: boolean
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
+  /** Exclusion globs relative to the search root. */
+  exclude?: Array<string>
+  /** Maximum number of entries to scan before stopping. */
+  scanLimit?: number
   /** Maximum number of matches to return. */
   maxCount?: number
   /** Skip first N matches. */
@@ -179,15 +198,21 @@ export interface GrepResult {
   matches: Array<GrepMatch>
   /**
    * Total matches across all files, or matched file count in filesWithMatches
-   * mode.
+   * mode. This is a lower bound when a result or scan limit is reached.
    */
   totalMatches: number
   /** Number of files with at least one match. */
   filesWithMatches: number
   /** Number of files searched. */
   filesSearched: number
-  /** Whether the limit/offset stopped the search early. */
+  /** Whether the result or scan limit stopped the search early. */
   limitReached?: boolean
+  /** Whether the result/match limit stopped the search early. */
+  resultLimitReached: boolean
+  /** Number of entries encountered before positive filtering. */
+  scannedEntries: number
+  /** Whether the scan budget stopped traversal. */
+  scanLimitReached: boolean
   /** Number of files skipped because they exceed the size limit. */
   skippedOversized?: number
 }

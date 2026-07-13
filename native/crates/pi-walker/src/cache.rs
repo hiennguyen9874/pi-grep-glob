@@ -21,8 +21,9 @@ struct CacheKey {
 
 #[derive(Clone)]
 struct CacheEntry {
-	created_at: Instant,
-	entries:    Vec<CollectedEntry>,
+	created_at:      Instant,
+	entries:         Vec<CollectedEntry>,
+	traversal_stats: crate::WalkTraversalStats,
 }
 
 static CACHE_TTL_MS: LazyLock<u64> =
@@ -296,8 +297,9 @@ where
 		let age = now.duration_since(entry.created_at);
 		if age < Duration::from_millis(ttl) {
 			return Ok(CollectedEntries {
-				entries:      entry.entries.clone(),
-				cache_age_ms: age.as_millis() as u64,
+				entries:         entry.entries.clone(),
+				cache_age_ms:    age.as_millis() as u64,
+				traversal_stats: entry.traversal_stats,
 			});
 		}
 		drop(entry);
@@ -305,9 +307,20 @@ where
 	}
 
 	let scan = collect_entries_uncached(root, options, heartbeat)?;
-	SCAN_CACHE.insert(key, CacheEntry { created_at: now, entries: scan.entries.clone() });
+	SCAN_CACHE.insert(
+		key,
+		CacheEntry {
+			created_at: now,
+			entries: scan.entries.clone(),
+			traversal_stats: scan.traversal_stats,
+		},
+	);
 	evict_oldest();
-	Ok(CollectedEntries { entries: scan.entries, cache_age_ms: 0 })
+	Ok(CollectedEntries {
+		entries: scan.entries,
+		cache_age_ms: 0,
+		traversal_stats: scan.traversal_stats,
+	})
 }
 
 pub fn collect_entries<H, E>(
