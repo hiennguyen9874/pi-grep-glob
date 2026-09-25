@@ -60,7 +60,7 @@ export function createGlobTool(): ToolDefinition<typeof globSchema, GlobToolDeta
     label: "Glob",
     description:
       "Find files and directories by file path, directory, glob pattern, or semicolon-/whitespace-delimited path list. Directories end with '/'.",
-    promptSnippet: "glob: find files/directories by path or glob pattern",
+    promptSnippet: "find files/directories by path or glob pattern",
     promptGuidelines: [
       "Use glob with limit=50 or less when exploring a broad or unfamiliar path. A plain directory path is recursive; use dir/* to inspect one level and narrow the glob before increasing the limit.",
       "Do not use glob to enumerate dataset, generated, dependency, build, or cache trees unless the task requires them; use grep directly with a narrow path/glob for content search.",
